@@ -6,6 +6,10 @@ description = "Unsynchronized Robustly Anamorphic ElGamal — COMP6453 Applied C
 license = "MIT"
 
 [dependencies]
+# Cryptographic big integers and prime tooling (incremental migration path)
+crypto-bigint = { version = "0.7", default-features = false, features = ["alloc", "rand_core", "getrandom", "zeroize"] }
+crypto-primes = { version = "0.7", default-features = false }
+
 # Arbitrary-precision integers with random generation support
 num-bigint = { version = "0.4", features = ["rand"] }
 num-traits = "0.2"
@@ -13,6 +17,7 @@ num-integer = "0.1"
 
 # Cryptographically secure RNG
 rand = "0.8"
+getrandom = { version = "0.4", features = ["sys_rng"] }
 
 # HMAC-SHA256 integrity (Owen's hardening layer)
 hmac = "0.12"
@@ -20,6 +25,9 @@ sha2 = "0.10"
 
 # Constant-time primitives (Owen's ct.rs)
 subtle = "2.5"
+
+# Standardized PKCS#7 padding algorithms
+block-padding = "0.4"
 
 # Secure memory zeroing
 zeroize = { version = "1.7", features = ["derive"] }

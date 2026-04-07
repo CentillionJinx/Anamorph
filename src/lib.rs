@@ -9,9 +9,9 @@
 //! - [`anamorphic`] — Anamorphic ElGamal (EC22): `aGen`, `aEnc`, `aDec`
 //! - [`params`]  — Safe-prime generation & group-parameter validation
 //! - [`errors`]  — Unified error types
-//! - [`integrity`] — (stub) HMAC-SHA256 integrity layer
-//! - [`padding`]  — (stub) Block-padding for length-oracle mitigation
-//! - [`ct`]       — (stub) Constant-time helpers
+//! - [`padding`]  — Block-padding for length-oracle mitigation
+//! - [`ct`]       — Constant-time helpers
+//! - [`hardening`] — Low-level HMAC helpers
 
 pub mod errors;
 pub mod params;
@@ -19,7 +19,6 @@ pub mod params;
 pub mod normal;
 pub mod anamorphic;
 
-// Stubs for other team members' contributions
-pub mod integrity;
+pub mod hardening;
 pub mod padding;
 pub mod ct;

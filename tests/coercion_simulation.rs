@@ -31,8 +31,7 @@ fn test_type1_prf_mode() {
     let ct = aencrypt(&pk, &dk, normal_msg, covert_msg).expect("aencrypt");
 
     // === Adversary's view (has sk, does NOT have dk) ===
-    let extracted_sk = sk.clone();
-    let adversary_view = decrypt(&extracted_sk, &ct).expect("adversary decrypt");
+    let adversary_view = decrypt(&sk, &ct).expect("adversary decrypt");
     assert_eq!(adversary_view, normal_msg.to_vec(),
         "adversary should see the normal message");
 

@@ -1,15 +1,64 @@
 //! Safe-prime generation, generator selection, and group-parameter validation.
 //!
 //! All ElGamal operations in this crate work in the multiplicative group
-//! Z*_p where p = 2q + 1 is a safe prime and g generates the order-q
+//! $Z_p^*$, where $$p = 2q + 1$$ is a safe prime and $g$ generates
+//! the order-$q$
 //! subgroup.
+//!
+//! **Owner:** Owen Ouyang - Security Hardening
+//!
+//! Scope in this module:
+//! - Secure parameter generation (safe-prime selection + generator validation).
+//! - Group membership validation for all externally provided elements.
+//! - CSPRNG-backed parameter sampling via system entropy sources.
 
+use crypto_bigint::{U1024, U2048, U256, U4096, U512, U8192};
+use crypto_primes::{random_prime, Flavor};
+use getrandom::SysRng;
 use num_bigint::{BigUint, RandBigInt};
 use num_integer::Integer;
-use num_traits::{One, Zero};
-use rand::thread_rng;
+use num_traits::One;
+use rand::rngs::OsRng;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
+use crate::ct::ct_modpow_biguint;
 use crate::errors::{AnamorphError, Result};
+
+struct InfallibleSysRng(SysRng);
+
+impl crypto_bigint::rand_core::TryRng for InfallibleSysRng {
+    type Error = crypto_bigint::rand_core::Infallible;
+
+    fn try_next_u32(&mut self) -> std::result::Result<u32, Self::Error> {
+        match self.0.try_next_u32() {
+            Ok(v) => Ok(v),
+            Err(_) => panic!("system RNG failure"),
+        }
+    }
+
+    fn try_next_u64(&mut self) -> std::result::Result<u64, Self::Error> {
+        match self.0.try_next_u64() {
+            Ok(v) => Ok(v),
+            Err(_) => panic!("system RNG failure"),
+        }
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> std::result::Result<(), Self::Error> {
+        match self.0.try_fill_bytes(dst) {
+            Ok(()) => Ok(()),
+            Err(_) => panic!("system RNG failure"),
+        }
+    }
+}
+
+impl crypto_bigint::rand_core::TryCryptoRng for InfallibleSysRng {}
+
+macro_rules! random_safe_prime_with_width {
+    ($ty:ty, $bit_size:expr, $rng:expr) => {{
+        let p = random_prime::<$ty, _>($rng, Flavor::Safe, $bit_size);
+        BigUint::from_bytes_be(&p.to_be_bytes())
+    }};
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -18,115 +67,162 @@ use crate::errors::{AnamorphError, Result};
 /// Parameters defining the cyclic group for ElGamal operations.
 ///
 /// **Invariants** (enforced at construction):
-/// - `p` is a safe prime: `p = 2q + 1` where `q` is also prime.
-/// - `g` is a generator of the order-`q` subgroup of Z*_p.
+/// - $p$ is a safe prime with $p = 2q + 1$ where $q$ is also prime.
+/// - $g$ is a generator of the order-$q$ subgroup of $Z_p^*$.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupParams {
     /// Safe prime modulus.
     pub p: BigUint,
-    /// Sophie Germain prime (p = 2q + 1).
+    /// Sophie Germain prime: $q$ such that $p = 2q + 1$.
     pub q: BigUint,
-    /// Generator of the order-q subgroup of Z*_p.
+    /// Generator of the order-$q$ subgroup of $Z_p^*$.
     pub g: BigUint,
     /// Bit-length that was requested when generating these parameters.
     pub bit_size: usize,
+}
+
+impl GroupParams {
+    /// Validate that these parameters form a safe-prime group with a valid
+    /// generator for the order-$q$ subgroup.
+    pub fn validate(&self) -> Result<()> {
+        let one = BigUint::one();
+
+        if self.p <= one || self.q <= one || self.g <= one {
+            return Err(AnamorphError::InvalidParameter(
+                "group parameters must be greater than 1".to_string(),
+            ));
+        }
+
+        if self.p != (&self.q << 1u32) + &one {
+            return Err(AnamorphError::InvalidParameter(
+                "p must satisfy p = 2q + 1".to_string(),
+            ));
+        }
+
+        if !is_probably_prime(&self.p, 40) || !is_probably_prime(&self.q, 40) {
+            return Err(AnamorphError::InvalidParameter(
+                "p and q must be prime".to_string(),
+            ));
+        }
+
+        validate_group_membership(&self.g, &self.p, &self.q)
+            .map_err(|_| {
+                AnamorphError::InvalidParameter(
+                    "g must be a member of the order-q subgroup".to_string(),
+                )
+            })
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Prime generation
 // ---------------------------------------------------------------------------
 
-/// Generate a safe prime `p = 2q + 1` of `bit_size` bits.
+/// Generate a safe prime $p = 2q + 1$ of `bit_size` bits.
 ///
-/// Both `p` and `q` are verified with the Miller-Rabin primality test
-/// using 40 rounds (error probability ≤ 2⁻⁸⁰).
-///
-/// # Panics
-/// Panics if `bit_size < 64`.
+/// Uses `crypto-primes` with `Flavor::Safe` to sample $p$ directly,
+/// then derives $q = (p - 1) / 2$.
 pub fn generate_safe_prime(bit_size: usize) -> Result<(BigUint, BigUint)> {
-    assert!(bit_size >= 64, "bit_size must be at least 64");
-
-    let mut rng = thread_rng();
-    let one = BigUint::one();
-    let two = &one + &one;
-
-    // Trial-division sieve for small factors — speeds up candidate rejection.
-    let small_primes: Vec<u64> = small_primes_list();
-
-    for _ in 0..100_000 {
-        // Generate a random odd number of the requested bit length.
-        let q_candidate = rng.gen_biguint((bit_size - 1) as u64) | &one;
-
-        // Quick trial-division reject.
-        if small_primes
-            .iter()
-            .any(|&sp| (&q_candidate % sp).is_zero() && q_candidate != BigUint::from(sp))
-        {
-            continue;
-        }
-
-        // Miller-Rabin on q.
-        if !is_probably_prime(&q_candidate, 40) {
-            continue;
-        }
-
-        let p_candidate = &q_candidate * &two + &one;
-
-        // Miller-Rabin on p.
-        if is_probably_prime(&p_candidate, 40) {
-            return Ok((p_candidate, q_candidate));
-        }
+    if bit_size < 64 {
+        return Err(AnamorphError::InvalidParameter(
+            "bit size must be at least 64".to_string(),
+        ));
     }
 
-    Err(AnamorphError::PrimeGenerationFailed)
+    let bit_size = u32::try_from(bit_size).map_err(|_| AnamorphError::PrimeGenerationFailed)?;
+    let mut rng = InfallibleSysRng(SysRng);
+
+    let p = match bit_size {
+        0..=256 => catch_unwind(AssertUnwindSafe(|| {
+            random_safe_prime_with_width!(U256, bit_size, &mut rng)
+        }))
+        .map_err(|_| AnamorphError::PrimeGenerationFailed)?,
+        257..=512 => catch_unwind(AssertUnwindSafe(|| {
+            random_safe_prime_with_width!(U512, bit_size, &mut rng)
+        }))
+        .map_err(|_| AnamorphError::PrimeGenerationFailed)?,
+        513..=1024 => catch_unwind(AssertUnwindSafe(|| {
+            random_safe_prime_with_width!(U1024, bit_size, &mut rng)
+        }))
+        .map_err(|_| AnamorphError::PrimeGenerationFailed)?,
+        1025..=2048 => catch_unwind(AssertUnwindSafe(|| {
+            random_safe_prime_with_width!(U2048, bit_size, &mut rng)
+        }))
+        .map_err(|_| AnamorphError::PrimeGenerationFailed)?,
+        2049..=4096 => catch_unwind(AssertUnwindSafe(|| {
+            random_safe_prime_with_width!(U4096, bit_size, &mut rng)
+        }))
+        .map_err(|_| AnamorphError::PrimeGenerationFailed)?,
+        4097..=8192 => catch_unwind(AssertUnwindSafe(|| {
+            random_safe_prime_with_width!(U8192, bit_size, &mut rng)
+        }))
+        .map_err(|_| AnamorphError::PrimeGenerationFailed)?,
+        _ => return Err(AnamorphError::PrimeGenerationFailed),
+    };
+
+    let q = (&p - BigUint::one()) >> 1u32;
+    Ok((p, q))
 }
 
 /// Generate full group parameters: safe prime + generator.
 pub fn generate_group_params(bit_size: usize) -> Result<GroupParams> {
     let (p, q) = generate_safe_prime(bit_size)?;
     let g = find_generator(&p, &q)?;
-    Ok(GroupParams {
+    let params = GroupParams {
         p,
         q,
         g,
         bit_size,
-    })
+    };
+
+    params.validate()?;
+    Ok(params)
 }
 
 // ---------------------------------------------------------------------------
 // Generator selection
 // ---------------------------------------------------------------------------
 
-/// Find a generator of the order-`q` subgroup of Z*_p.
+/// Find a generator of the order-q subgroup of $Z_p^*$.
 ///
-/// For a safe prime `p = 2q + 1` the subgroup of order `q` in Z*_p
-/// consists of the quadratic residues mod `p`.  A random element `h` of
-/// Z*_p is a generator of this subgroup iff `h² ≢ 1 (mod p)` and
-/// `h^q ≡ 1 (mod p)` (equivalently, `h ≠ ±1 mod p`).
+/// Find a generator of the order-$q$ subgroup of $Z_p^*$.
+///
+/// For a safe prime $p = 2q + 1$, the subgroup of order $q$ in $Z_p^*$ consists
+/// of the quadratic residues $(\bmod p)$.
+///
+/// This function samples $h$ uniformly from $Z_p^*$ and sets $g = h^2 \pmod{p}$,
+/// so $g$ is guaranteed to lie in the order-$q$ subgroup. Since $q$ is prime, any
+/// non-identity element has order $q$; therefore checking $g \neq 1$ suffices for
+/// $g$ to be a generator of that subgroup.
 pub fn find_generator(p: &BigUint, q: &BigUint) -> Result<BigUint> {
-    let mut rng = thread_rng();
+    let mut rng = OsRng;
     let one = BigUint::one();
     let p_minus_one = p - &one;
 
     for _ in 0..1_000 {
         let h = rng.gen_biguint_range(&BigUint::from(2u32), &p_minus_one);
 
-        // Compute g = h^2 mod p to guarantee g is in the order-q subgroup.
-        let g = h.modpow(&BigUint::from(2u32), p);
+        // Compute $g = h^2 \pmod{p}$ to guarantee $g$ is in the order-$q$ subgroup.
+        let g = ct_modpow_biguint(&h, &BigUint::from(2u32), p)?;
 
         // Reject the identity element.
         if g == one {
             continue;
         }
 
-        // Verify: g^q ≡ 1 (mod p).
-        debug_assert!(g.modpow(q, p) == one, "generator check failed");
+        // Verify: $g^q \equiv 1 \pmod{p}$.
+        debug_assert!(
+            ct_modpow_biguint(&g, q, p)
+                .map(|v| v == one)
+                .unwrap_or(false),
+            "generator check failed"
+        );
 
         return Ok(g);
     }
 
     Err(AnamorphError::InvalidParameter(
-        "could not find a generator".into(),
+        "failed to find a subgroup generator".to_string(),
     ))
 }
 
@@ -134,9 +230,11 @@ pub fn find_generator(p: &BigUint, q: &BigUint) -> Result<BigUint> {
 // Group membership
 // ---------------------------------------------------------------------------
 
-/// Validate that `element` is a member of the order-`q` subgroup of Z*_p.
+/// Validate that `element` is a member of the order-q subgroup of Z_p^*.
 ///
-/// Returns `Ok(())` if `1 < element < p` and `element^q ≡ 1 (mod p)`.
+/// Validate that `element` is a member of the order-$q$ subgroup of $Z_p^*$.
+///
+/// Returns `Ok(())` if $1 < \text{element} < p$ and $\text{element}^q \equiv 1 \pmod{p}$.
 pub fn validate_group_membership(
     element: &BigUint,
     p: &BigUint,
@@ -148,7 +246,7 @@ pub fn validate_group_membership(
         return Err(AnamorphError::GroupMembershipError);
     }
 
-    if element.modpow(q, p) != one {
+    if ct_modpow_biguint(element, q, p)? != one {
         return Err(AnamorphError::GroupMembershipError);
     }
 
@@ -159,18 +257,20 @@ pub fn validate_group_membership(
 // Miller-Rabin primality test
 // ---------------------------------------------------------------------------
 
-/// Probabilistic Miller-Rabin primality test with `k` rounds.
+/// Probabilistic Miller-Rabin primality test with k rounds.
 ///
-/// Error probability ≤ 4^{-k}.
+/// Probabilistic Miller-Rabin primality test with $k$ rounds.
+///
+/// Error probability is at most $4^{-k}$ for $k \geq 1$.
+/// Returns `false` when $k = 0$.
 pub fn is_probably_prime(n: &BigUint, k: u32) -> bool {
-    let _zero = BigUint::zero();
     let one = BigUint::one();
-    let two = BigUint::from(2u32);
-    let three = BigUint::from(3u32);
 
-    if n <= &one {
+    if k == 0 || n <= &one {
         return false;
     }
+    let two = BigUint::from(2u32);
+    let three = BigUint::from(3u32);
     if n == &two || n == &three {
         return true;
     }
@@ -178,21 +278,21 @@ pub fn is_probably_prime(n: &BigUint, k: u32) -> bool {
         return false;
     }
 
-    // Write n - 1 = 2^s * d with d odd.
+    // Write $n - 1 = 2^s \cdot d$ where $d$ is odd.
     let n_minus_one = n - &one;
     let mut d = n_minus_one.clone();
-    let mut s: u64 = 0;
+    let mut s: u32 = 0;
     while d.is_even() {
         d >>= 1;
         s += 1;
     }
 
-    let mut rng = thread_rng();
+    let mut rng = rand::thread_rng();
 
     'witness: for _ in 0..k {
         // Pick random a in [2, n-2].
         let a = if n > &BigUint::from(4u32) {
-            rng.gen_biguint_range(&two, &(&n_minus_one))
+            rng.gen_biguint_range(&two, &n_minus_one)
         } else {
             two.clone()
         };
@@ -203,17 +303,17 @@ pub fn is_probably_prime(n: &BigUint, k: u32) -> bool {
             continue 'witness;
         }
 
-        for _ in 0..s - 1 {
+        for _ in 0..s.saturating_sub(1) {
             x = x.modpow(&two, n);
             if x == n_minus_one {
                 continue 'witness;
             }
         }
 
-        return false; // composite
+        return false;
     }
 
-    true // probably prime
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +321,7 @@ pub fn is_probably_prime(n: &BigUint, k: u32) -> bool {
 // ---------------------------------------------------------------------------
 
 /// First 100 small primes for trial-division sieving.
+#[cfg(test)]
 fn small_primes_list() -> Vec<u64> {
     vec![
         2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61,
@@ -236,6 +337,8 @@ fn small_primes_list() -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ct::ct_modpow_biguint;
+    use num_traits::Zero;
 
     #[test]
     fn test_small_primes_are_prime() {
@@ -259,9 +362,15 @@ mod tests {
     }
 
     #[test]
+    fn test_miller_rabin_zero_rounds_are_rejected() {
+        assert!(!is_probably_prime(&BigUint::from(9u32), 0));
+        assert!(!is_probably_prime(&BigUint::from(13u32), 0));
+    }
+
+    #[test]
     fn test_generate_safe_prime_64bit() {
         let (p, q) = generate_safe_prime(64).expect("safe prime generation");
-        // Verify p = 2q + 1
+        // Verify $p = 2q + 1$
         assert_eq!(p, &q * 2u32 + 1u32);
         // Verify both are prime
         assert!(is_probably_prime(&p, 40));
@@ -273,8 +382,8 @@ mod tests {
         let (p, q) = generate_safe_prime(64).expect("safe prime generation");
         let g = find_generator(&p, &q).expect("generator");
         // g^q ≡ 1 (mod p)
-        assert_eq!(g.modpow(&q, &p), BigUint::one());
-        // g ≠ 1
+        assert_eq!(ct_modpow_biguint(&g, &q, &p).expect("modpow"), BigUint::one());
+        // g != 1
         assert_ne!(g, BigUint::one());
     }
 
