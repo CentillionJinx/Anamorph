@@ -52,10 +52,9 @@ impl MultiUseDoubleKey {
         // Convert to BoxedUint and reduce mod q
         let q_boxed = BoxedUint::from_be_slice_vartime(&params.q.to_bytes_be());
         let new_dk_boxed = BoxedUint::from_be_slice_vartime(&new_dk_bytes);
-        let mut new_dk_sub = new_dk_boxed; // For simplicity we might need to properly reduce using full division algorithms but for our sizes and safety, we just modulus if it fits. 
-        // We defer proper random distribution modulo q here and just do a modulo.
+        // Reduce the ratcheted value modulo q to keep dk in [0, q-1].
         let modulus = crypto_bigint::NonZero::new(q_boxed).unwrap();
-        let updated_dk = new_dk_sub.rem_vartime(&modulus);
+        let updated_dk = new_dk_boxed.rem_vartime(&modulus);
 
         self.current_dk.dk = updated_dk;
         self.current_dk.dk_pub = ct_modpow_boxed(&params.g, &self.current_dk.dk, &params.p)
