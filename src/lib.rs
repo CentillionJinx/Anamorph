@@ -18,6 +18,7 @@ pub mod params;
 
 pub mod normal;
 pub mod anamorphic;
+pub mod ec24;
 
 pub mod hardening;
 pub mod padding;
