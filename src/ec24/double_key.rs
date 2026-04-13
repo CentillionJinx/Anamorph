@@ -4,16 +4,18 @@
 //! to allow sending a stream of anamorphic ciphertexts without reusing the
 //! exact same PRF key, maintaining security against Chosen Ciphertext Attacks (CCA).
 
-use crypto_bigint::BoxedUint;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::anamorphic::keygen::DoubleKey;
+use crate::ct::{ct_modpow_boxed, ct_scalar_from_bytes_mod_q};
 use crate::params::GroupParams;
-use crate::ct::ct_modpow_boxed;
 
 type HmacSha256 = Hmac<Sha256>;
+
+const RATCHET_EXTRACT_SALT: &[u8] = b"anamorph-ec24-ratchet-extract-v1";
+const RATCHET_EXPAND_INFO: &[u8] = b"anamorph-ec24-ratchet-expand-v1";
 
 /// A stateful double key supporting multiple uses via HMAC ratcheting.
 #[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
@@ -35,26 +37,21 @@ impl MultiUseDoubleKey {
 
     /// Ratchet the double key forward for the next use.
     ///
-    /// The new secret exponent is derived as `HMAC-SHA256(dk, "ratchet" || use_count) mod q`.
+    /// The new secret exponent is derived using an HKDF-like extract/expand
+    /// structure with explicit domain separation and direct scalar reduction.
     /// The structure updates `current_dk.dk` and `current_dk.dk_pub`.
     pub fn ratchet(&mut self, params: &GroupParams) {
         self.use_count += 1;
 
+        let q_byte_len = ((params.q.bits() + 7) / 8) as usize;
+        let out_len = q_byte_len.saturating_mul(2).max(1);
+
         let mut dk_bytes = self.current_dk.dk.to_be_bytes().to_vec();
-        let mut mac = HmacSha256::new_from_slice(&dk_bytes).expect("HMAC accepts any key length");
-        mac.update(b"ratchet");
-        mac.update(&self.use_count.to_be_bytes());
-        let result = mac.finalize().into_bytes();
-        
-        let new_dk_bytes = result.to_vec();
+        let mut derived_bytes = derive_ratchet_bytes(&dk_bytes, self.use_count, out_len);
+        let updated_dk = ct_scalar_from_bytes_mod_q(&derived_bytes, &params.q)
+            .expect("q must be non-zero and representable");
+        derived_bytes.zeroize();
         dk_bytes.zeroize();
-        
-        // Convert to BoxedUint and reduce mod q
-        let q_boxed = BoxedUint::from_be_slice_vartime(&params.q.to_bytes_be());
-        let new_dk_boxed = BoxedUint::from_be_slice_vartime(&new_dk_bytes);
-        // Reduce the ratcheted value modulo q to keep dk in [0, q-1].
-        let modulus = crypto_bigint::NonZero::new(q_boxed).unwrap();
-        let updated_dk = new_dk_boxed.rem_vartime(&modulus);
 
         self.current_dk.dk = updated_dk;
         self.current_dk.dk_pub = ct_modpow_boxed(&params.g, &self.current_dk.dk, &params.p)
@@ -65,4 +62,39 @@ impl MultiUseDoubleKey {
     pub fn current_key(&self) -> &DoubleKey {
         &self.current_dk
     }
+}
+
+fn derive_ratchet_bytes(ikm: &[u8], use_count: u64, out_len: usize) -> Vec<u8> {
+    let mut extract_mac = HmacSha256::new_from_slice(RATCHET_EXTRACT_SALT)
+        .expect("HMAC accepts any key length");
+    extract_mac.update(ikm);
+    let mut prk = extract_mac.finalize().into_bytes();
+
+    let mut okm = Vec::with_capacity(out_len);
+    let mut previous_block = Vec::new();
+    let use_count_bytes = use_count.to_be_bytes();
+    let mut counter = 1u64;
+
+    while okm.len() < out_len {
+        let mut expand_mac = HmacSha256::new_from_slice(&prk)
+            .expect("HMAC accepts any key length");
+        if !previous_block.is_empty() {
+            expand_mac.update(&previous_block);
+        }
+        expand_mac.update(RATCHET_EXPAND_INFO);
+        expand_mac.update(&use_count_bytes);
+        expand_mac.update(b"dk_update");
+        expand_mac.update(&counter.to_be_bytes());
+
+        let block = expand_mac.finalize().into_bytes().to_vec();
+        okm.extend_from_slice(&block);
+        previous_block.zeroize();
+        previous_block = block;
+        counter += 1;
+    }
+
+    prk.zeroize();
+    previous_block.zeroize();
+    okm.truncate(out_len);
+    okm
 }

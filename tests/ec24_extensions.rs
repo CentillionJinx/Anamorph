@@ -4,11 +4,14 @@
 //! covert-message presence indicator.
 
 use anamorph::anamorphic::{
-    akeygen, aencrypt, adecrypt, aencrypt_xor, adecrypt_xor,
+    adecrypt, adecrypt_xor, aencrypt, aencrypt_xor, akeygen,
 };
-use anamorph::anamorphic::decrypt::verify_covert_presence;
-use anamorph::ec24::MultiUseDoubleKey;
-use anamorph::normal::{encrypt, decrypt};
+use anamorph::ec24::{verify_covert_indicator, MultiUseDoubleKey};
+use anamorph::errors::AnamorphError;
+use anamorph::normal::{decrypt, encrypt};
+
+const TEST_MAC_KEY: &[u8] = b"0123456789abcdef";
+const TEST_BLOCK_SIZE: usize = 8;
 
 // =========================================================================
 // Multi-Use Double Key (Ratcheting)
@@ -18,18 +21,32 @@ use anamorph::normal::{encrypt, decrypt};
 /// covert message, proving that the underlying dk has changed.
 #[test]
 fn test_ratchet_produces_distinct_ciphertexts() {
-    let (pk, _sk, dk) = akeygen(64).expect("akeygen");
+    let (pk, _sk, dk) = akeygen(128).expect("akeygen");
     let mut multi_dk = MultiUseDoubleKey::new(dk);
 
-    let ct0 = aencrypt(&pk, multi_dk.current_key(), b"msg", b"cov")
+    let ct0 = aencrypt(
+        &pk,
+        multi_dk.current_key(),
+        b"msg",
+        b"cov",
+        TEST_MAC_KEY,
+        TEST_BLOCK_SIZE,
+    )
         .expect("enc round 0");
 
     multi_dk.ratchet(&pk.params);
 
-    let ct1 = aencrypt(&pk, multi_dk.current_key(), b"msg", b"cov")
+    let ct1 = aencrypt(
+        &pk,
+        multi_dk.current_key(),
+        b"msg",
+        b"cov",
+        TEST_MAC_KEY,
+        TEST_BLOCK_SIZE,
+    )
         .expect("enc round 1");
 
-    // Same normal + covert inputs → different ciphertext after ratchet.
+    // Same normal + covert inputs -> different ciphertext after ratchet.
     assert_ne!(ct0, ct1, "ratcheted key must produce different ciphertext");
 }
 
@@ -37,36 +54,41 @@ fn test_ratchet_produces_distinct_ciphertexts() {
 /// when both sender and receiver ratchet in lockstep.
 #[test]
 fn test_ratchet_roundtrip_lockstep() {
-    let (pk, sk, dk) = akeygen(64).expect("akeygen");
+    let (pk, sk, dk) = akeygen(128).expect("akeygen");
     let mut sender_dk = MultiUseDoubleKey::new(dk.clone());
     let mut receiver_dk = MultiUseDoubleKey::new(dk);
 
     for round in 0..5 {
         let covert = format!("covert-{round}");
-        let ct = aencrypt(
+        let packet = aencrypt(
             &pk,
             sender_dk.current_key(),
             b"normal",
             covert.as_bytes(),
+            TEST_MAC_KEY,
+            TEST_BLOCK_SIZE,
         )
         .expect("sender encrypt");
 
         // Both parties verify covert presence
-        let present = verify_covert_presence(
+        let present = verify_covert_indicator(
             receiver_dk.current_key(),
-            &ct,
+            &packet,
+            TEST_MAC_KEY,
             covert.as_bytes(),
             &pk.params.p,
             &pk.params.q,
             &pk.params.g,
-        );
+        )
+        .expect("covert indicator");
         assert!(present, "covert should be detectable in round {round}");
 
         // Receiver recovers both messages
         let result = adecrypt(
             &sk,
             receiver_dk.current_key(),
-            &ct,
+            &packet,
+            TEST_MAC_KEY,
             covert.as_bytes(),
         )
         .expect("receiver decrypt");
@@ -87,45 +109,56 @@ fn test_ratchet_roundtrip_lockstep() {
 /// for new ciphertexts, preventing replay across epochs.
 #[test]
 fn test_ratchet_forward_secrecy() {
-    let (pk, _sk, dk) = akeygen(64).expect("akeygen");
+    let (pk, _sk, dk) = akeygen(128).expect("akeygen");
     let mut multi_dk = MultiUseDoubleKey::new(dk.clone());
     let old_dk = dk; // snapshot of epoch 0
 
     multi_dk.ratchet(&pk.params);
 
-    let ct = aencrypt(&pk, multi_dk.current_key(), b"msg", b"cov")
+    let packet = aencrypt(
+        &pk,
+        multi_dk.current_key(),
+        b"msg",
+        b"cov",
+        TEST_MAC_KEY,
+        TEST_BLOCK_SIZE,
+    )
         .expect("encrypt with ratcheted key");
 
     // Old (pre-ratchet) key should NOT verify presence
-    let stale_check = verify_covert_presence(
+    let stale_check = verify_covert_indicator(
         &old_dk,
-        &ct,
+        &packet,
+        TEST_MAC_KEY,
         b"cov",
         &pk.params.p,
         &pk.params.q,
         &pk.params.g,
-    );
+    )
+    .expect("stale indicator");
     assert!(
         !stale_check,
         "old dk should not verify ciphertext from ratcheted epoch"
     );
 
     // Current key SHOULD verify
-    let current_check = verify_covert_presence(
+    let current_check = verify_covert_indicator(
         multi_dk.current_key(),
-        &ct,
+        &packet,
+        TEST_MAC_KEY,
         b"cov",
         &pk.params.p,
         &pk.params.q,
         &pk.params.g,
-    );
+    )
+    .expect("current indicator");
     assert!(current_check, "current dk should verify");
 }
 
 /// use_count must advance monotonically with each ratchet.
 #[test]
 fn test_ratchet_use_count() {
-    let (pk, _, dk) = akeygen(64).expect("akeygen");
+    let (pk, _, dk) = akeygen(128).expect("akeygen");
     let mut multi_dk = MultiUseDoubleKey::new(dk);
     assert_eq!(multi_dk.use_count, 0);
 
@@ -142,21 +175,28 @@ fn test_ratchet_use_count() {
 /// XOR mode should also work across ratchet rounds.
 #[test]
 fn test_ratchet_xor_mode() {
-    let (pk, sk, dk) = akeygen(64).expect("akeygen");
+    let (pk, sk, dk) = akeygen(128).expect("akeygen");
     let mut sender_dk = MultiUseDoubleKey::new(dk.clone());
     let mut receiver_dk = MultiUseDoubleKey::new(dk);
 
     for round in 0..3 {
         let covert = format!("xor-covert-{round}");
-        let (ct, enc) = aencrypt_xor(
+        let packet = aencrypt_xor(
             &pk,
             sender_dk.current_key(),
             b"normal",
             covert.as_bytes(),
+            TEST_MAC_KEY,
+            TEST_BLOCK_SIZE,
         )
         .expect("XOR encrypt");
 
-        let result = adecrypt_xor(&sk, receiver_dk.current_key(), &ct, &enc)
+        let result = adecrypt_xor(
+            &sk,
+            receiver_dk.current_key(),
+            &packet,
+            TEST_MAC_KEY,
+        )
             .expect("XOR decrypt");
         assert_eq!(result.normal_msg, b"normal".to_vec());
         assert_eq!(
@@ -178,50 +218,76 @@ fn test_ratchet_xor_mode() {
 /// with the correct candidate, and false for wrong candidates.
 #[test]
 fn test_presence_indicator_correct_candidate() {
-    let (pk, _, dk) = akeygen(64).expect("akeygen");
-    let ct = aencrypt(&pk, &dk, b"hello", b"secret").expect("aencrypt");
+    let (pk, _, dk) = akeygen(128).expect("akeygen");
+    let packet = aencrypt(
+        &pk,
+        &dk,
+        b"hello",
+        b"secret",
+        TEST_MAC_KEY,
+        TEST_BLOCK_SIZE,
+    )
+    .expect("aencrypt");
 
-    assert!(verify_covert_presence(
-        &dk, &ct, b"secret",
+    assert!(verify_covert_indicator(
+        &dk,
+        &packet,
+        TEST_MAC_KEY,
+        b"secret",
         &pk.params.p, &pk.params.q, &pk.params.g,
-    ));
-    assert!(!verify_covert_presence(
-        &dk, &ct, b"wrong",
+    )
+    .expect("indicator true"));
+    assert!(!verify_covert_indicator(
+        &dk,
+        &packet,
+        TEST_MAC_KEY,
+        b"wrong",
         &pk.params.p, &pk.params.q, &pk.params.g,
-    ));
+    )
+    .expect("indicator false"));
 }
 
 /// verify_covert_presence must return false for a normal (non-anamorphic)
 /// ciphertext, even when given the correct dk.
 #[test]
 fn test_presence_indicator_normal_ct() {
-    let (pk, _, dk) = akeygen(64).expect("akeygen");
-    let ct = encrypt(&pk, b"hello").expect("normal encrypt");
+    let (pk, _, dk) = akeygen(128).expect("akeygen");
+    let packet = encrypt(&pk, b"hello", TEST_MAC_KEY, TEST_BLOCK_SIZE).expect("normal encrypt");
 
     // No covert payload was embedded, so any candidate should fail.
-    assert!(!verify_covert_presence(
-        &dk, &ct, b"anything",
+    assert!(verify_covert_indicator(
+        &dk,
+        &packet,
+        TEST_MAC_KEY,
+        b"anything",
         &pk.params.p, &pk.params.q, &pk.params.g,
-    ));
+    )
+    .is_err());
 }
 
-/// Indistinguishability under normal decryption: both normal and
-/// anamorphic ciphertexts decrypt identically with the secret key alone.
+/// Secure packet domain separation: normal decryptor must reject anamorphic packets.
 #[test]
 fn test_ec24_indistinguishability() {
-    let (pk, sk, dk) = akeygen(64).expect("akeygen");
+    let (pk, sk, dk) = akeygen(128).expect("akeygen");
     let mut multi_dk = MultiUseDoubleKey::new(dk);
 
-    let normal_ct = encrypt(&pk, b"msg").expect("normal encrypt");
+    let normal_packet = encrypt(&pk, b"msg", TEST_MAC_KEY, TEST_BLOCK_SIZE).expect("normal encrypt");
 
     multi_dk.ratchet(&pk.params);
-    let ec24_ct = aencrypt(&pk, multi_dk.current_key(), b"msg", b"hidden")
+    let ec24_packet = aencrypt(
+        &pk,
+        multi_dk.current_key(),
+        b"msg",
+        b"hidden",
+        TEST_MAC_KEY,
+        TEST_BLOCK_SIZE,
+    )
         .expect("ec24 encrypt");
 
-    let n_dec = decrypt(&sk, &normal_ct).expect("normal decrypt");
-    let a_dec = decrypt(&sk, &ec24_ct).expect("ec24 decrypt");
+    let n_dec = decrypt(&sk, &normal_packet, TEST_MAC_KEY).expect("normal decrypt");
+    let a_dec = decrypt(&sk, &ec24_packet, TEST_MAC_KEY);
 
-    assert_eq!(n_dec, a_dec, "both must decrypt to the same normal message");
+    assert!(matches!(a_dec, Err(AnamorphError::DecryptionFailed(_))));
     assert_eq!(n_dec, b"msg".to_vec());
 }
 
@@ -233,22 +299,35 @@ fn test_ec24_indistinguishability() {
 /// sees only the normal plaintext.
 #[test]
 fn test_type1_coercion_ec24_ratcheted() {
-    let (pk, sk, dk) = akeygen(64).expect("akeygen");
+    let (pk, sk, dk) = akeygen(128).expect("akeygen");
     let mut multi_dk = MultiUseDoubleKey::new(dk);
 
     // Ratchet a few times
     multi_dk.ratchet(&pk.params);
     multi_dk.ratchet(&pk.params);
 
-    let ct = aencrypt(&pk, multi_dk.current_key(), b"safe", b"HELP")
+    let packet = aencrypt(
+        &pk,
+        multi_dk.current_key(),
+        b"safe",
+        b"HELP",
+        TEST_MAC_KEY,
+        TEST_BLOCK_SIZE,
+    )
         .expect("encrypt");
 
     // Adversary with sk only
-    let adversary = decrypt(&sk, &ct).expect("adversary decrypt");
-    assert_eq!(adversary, b"safe".to_vec());
+    let adversary = decrypt(&sk, &packet, TEST_MAC_KEY);
+    assert!(matches!(adversary, Err(AnamorphError::DecryptionFailed(_))));
 
     // Receiver with same ratchet state
-    let receiver = adecrypt(&sk, multi_dk.current_key(), &ct, b"HELP")
+    let receiver = adecrypt(
+        &sk,
+        multi_dk.current_key(),
+        &packet,
+        TEST_MAC_KEY,
+        b"HELP",
+    )
         .expect("receiver decrypt");
     assert_eq!(receiver.normal_msg, b"safe".to_vec());
     assert_eq!(receiver.covert_msg, Some(b"HELP".to_vec()));

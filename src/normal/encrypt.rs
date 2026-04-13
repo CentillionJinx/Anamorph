@@ -37,10 +37,17 @@ pub struct Ciphertext {
 /// Prepends a 0x01 byte to guarantee the value is positive and non-zero,
 /// then checks that the result is less than `p`.
 pub fn encode_message(msg: &[u8], p: &BigUint) -> Result<BigUint> {
-    // Prepend 0x01 to ensure the encoding is always > 0
-    let mut padded = vec![0x01];
-    padded.extend_from_slice(msg);
-    let m = BigUint::from_bytes_be(&padded);
+    // Bound check first to avoid constructing oversized intermediates.
+    let p_width = ((p.bits() + 7) / 8) as usize;
+    if msg.len() + 1 > p_width {
+        return Err(AnamorphError::MessageTooLarge);
+    }
+
+    // Prepend 0x01 to ensure the encoding is always > 0.
+    let mut encoded = Vec::with_capacity(msg.len() + 1);
+    encoded.push(0x01);
+    encoded.extend_from_slice(msg);
+    let m = BigUint::from_bytes_be(&encoded);
 
     if &m >= p {
         return Err(AnamorphError::MessageTooLarge);
@@ -71,7 +78,7 @@ pub fn decode_message(m: &BigUint) -> Result<Vec<u8>> {
 /// 3. Compute `c1 = g^r mod p`, `c2 = m · h^r mod p`.
 ///
 /// Returns `Ciphertext { c1, c2 }`.
-pub fn encrypt(pk: &PublicKey, msg: &[u8]) -> Result<Ciphertext> {
+pub fn encrypt_legacy(pk: &PublicKey, msg: &[u8]) -> Result<Ciphertext> {
     let m = encode_message(msg, &pk.params.p)?;
     let mut rng = rand::thread_rng();
     let r = rng.gen_biguint_range(&BigUint::one(), &pk.params.q);
@@ -82,30 +89,28 @@ pub fn encrypt(pk: &PublicKey, msg: &[u8]) -> Result<Ciphertext> {
 ///
 /// Output packet format:
 /// `version || domain || block_size || c1_fixed || c2_fixed || tag`.
-pub fn encrypt_padded_authenticated(
+pub fn encrypt(
     pk: &PublicKey,
     msg: &[u8],
     mac_key: &[u8],
     block_size: usize,
 ) -> Result<Vec<u8>> {
     let padded = pad_pkcs7(msg, block_size)?;
-    let ct = encrypt(pk, &padded)?;
+    let ct = encrypt_legacy(pk, &padded)?;
     let ct_bytes = serialize_ciphertext_for_modulus(&ct, &pk.params.p)?;
 
     let block_size_u8 = u8::try_from(block_size).map_err(|_| {
         AnamorphError::InvalidParameter("block size must fit in one byte".into())
     })?;
 
-    let mut body = Vec::with_capacity(2 + ct_bytes.len());
-    body.push(SECURE_PACKET_DOMAIN_NORMAL);
-    body.push(block_size_u8);
-    body.extend_from_slice(&ct_bytes);
-
-    let tag = generate_mac(mac_key, &body)?;
-
-    let mut packet = Vec::with_capacity(1 + body.len() + MAC_SIZE);
+    // Include Version in the authenticated envelope
+    let mut packet = Vec::with_capacity(1 + 2 + ct_bytes.len() + MAC_SIZE);
     packet.push(SECURE_PACKET_VERSION);
-    packet.extend_from_slice(&body);
+    packet.push(SECURE_PACKET_DOMAIN_NORMAL);
+    packet.push(block_size_u8);
+    packet.extend_from_slice(&ct_bytes);
+
+    let tag = generate_mac(mac_key, &packet)?;
     packet.extend_from_slice(&tag);
     Ok(packet)
 }
@@ -122,12 +127,12 @@ pub fn encrypt_with_randomness(pk: &PublicKey, m: &BigUint, r: &BigUint) -> Resu
     let g = &pk.params.g;
     let h = &pk.h;
 
-    // c1 = g^r mod p
-    let c1 = g.modpow(r, p);
+    // Use constant-time modular exponentiation to protect the secret randomness `r`
+    let c1 = crate::ct::ct_modpow_biguint(g, r, p)?;
 
-    // c2 = m * h^r mod p
-    let hr = h.modpow(r, p);
-    let c2 = (m * &hr) % p;
+    let hr = crate::ct::ct_modpow_biguint(h, r, p)?;
+    // Use constant-time modular multiplication to protect the shared secret `hr`
+    let c2 = crate::ct::ct_mul_mod_biguint(m, &hr, p)?;
 
     Ok(Ciphertext { c1, c2 })
 }
@@ -152,7 +157,7 @@ pub(crate) fn serialize_ciphertext_for_modulus(ct: &Ciphertext, p: &BigUint) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::normal::decrypt::decrypt_padded_authenticated;
+    use crate::normal::decrypt::decrypt;
     use crate::normal::keygen::keygen;
     use num_traits::Zero;
 
@@ -177,7 +182,7 @@ mod tests {
     #[test]
     fn test_encrypt_produces_ciphertext() {
         let (pk, _) = keygen(64).expect("keygen");
-        let ct = encrypt(&pk, b"test").expect("encrypt");
+        let ct = encrypt_legacy(&pk, b"test").expect("encrypt");
         // c1 and c2 should be non-zero
         assert!(!ct.c1.is_zero());
         assert!(!ct.c2.is_zero());
@@ -186,8 +191,8 @@ mod tests {
     #[test]
     fn test_different_encryptions_differ() {
         let (pk, _) = keygen(64).expect("keygen");
-        let ct1 = encrypt(&pk, b"test").expect("encrypt1");
-        let ct2 = encrypt(&pk, b"test").expect("encrypt2");
+        let ct1 = encrypt_legacy(&pk, b"test").expect("encrypt1");
+        let ct2 = encrypt_legacy(&pk, b"test").expect("encrypt2");
         // Different random r means different ciphertexts (with overwhelming probability)
         assert_ne!(ct1, ct2);
     }
@@ -197,9 +202,9 @@ mod tests {
         let (pk, sk) = keygen(128).expect("keygen");
         let mac_key = b"0123456789abcdef";
 
-        let packet = encrypt_padded_authenticated(&pk, b"ok", mac_key, 8)
+        let packet = encrypt(&pk, b"ok", mac_key, 8)
             .expect("secure encrypt");
-        let plain = decrypt_padded_authenticated(&sk, &packet, mac_key)
+        let plain = decrypt(&sk, &packet, mac_key)
             .expect("secure decrypt");
 
         assert_eq!(plain, b"ok");

@@ -23,7 +23,7 @@
 //!
 //! Best for: arbitrary-length covert messages transmitted across a stream of ciphertexts.
 
-use crypto_bigint::{BoxedUint, NonZero};
+use crypto_bigint::BoxedUint;
 use hmac::{Hmac, KeyInit, Mac};
 use num_bigint::{BigUint, RandBigInt};
 use num_traits::One;
@@ -31,7 +31,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
 use super::keygen::DoubleKey;
-use crate::ct::ct_modpow_boxed;
+use crate::ct::{ct_modpow_boxed, ct_scalar_from_bytes_mod_q};
 use crate::errors::{AnamorphError, Result};
 use crate::hardening::{generate_mac, MAC_SIZE};
 use crate::normal::encrypt::{
@@ -65,8 +65,8 @@ type HmacSha256 = Hmac<Sha256>;
 ///
 /// The receiver must know the covert message space to recover
 /// `covert_msg` (via candidate verification or brute-force search).
-/// For arbitrary-length extraction, use [`aencrypt_stream`] instead.
-pub fn aencrypt(
+/// For arbitrary-length extraction, use [`aencrypt_stream_legacy`] instead.
+pub fn aencrypt_legacy(
     pk: &PublicKey,
     dk: &DoubleKey,
     normal_msg: &[u8],
@@ -78,7 +78,7 @@ pub fn aencrypt(
 }
 
 /// PRF-mode anamorphic encryption with PKCS#7 padding and HMAC authentication.
-pub fn aencrypt_padded_authenticated(
+pub fn aencrypt(
     pk: &PublicKey,
     dk: &DoubleKey,
     normal_msg: &[u8],
@@ -87,21 +87,19 @@ pub fn aencrypt_padded_authenticated(
     block_size: usize,
 ) -> Result<Vec<u8>> {
     let padded = pad_pkcs7(normal_msg, block_size)?;
-    let ct = aencrypt(pk, dk, &padded, covert_msg)?;
+    let ct = aencrypt_legacy(pk, dk, &padded, covert_msg)?;
     let ct_body = serialize_ciphertext_for_modulus(&ct, &pk.params.p)?;
     let block_size_u8 = u8::try_from(block_size).map_err(|_| {
         AnamorphError::InvalidParameter("block size must fit in one byte".into())
     })?;
 
-    let mut body = Vec::with_capacity(2 + ct_body.len());
-    body.push(SECURE_PACKET_DOMAIN_ANAMORPHIC_PRF);
-    body.push(block_size_u8);
-    body.extend_from_slice(&ct_body);
-
-    let tag = generate_mac(mac_key, &body)?;
-    let mut packet = Vec::with_capacity(1 + body.len() + MAC_SIZE);
+    let mut packet = Vec::with_capacity(1 + 2 + ct_body.len() + MAC_SIZE);
     packet.push(SECURE_PACKET_VERSION);
-    packet.extend_from_slice(&body);
+    packet.push(SECURE_PACKET_DOMAIN_ANAMORPHIC_PRF);
+    packet.push(block_size_u8);
+    packet.extend_from_slice(&ct_body);
+
+    let tag = generate_mac(mac_key, &packet)?;
     packet.extend_from_slice(&tag);
     Ok(packet)
 }
@@ -120,12 +118,13 @@ pub(crate) fn derive_randomness(dk: &DoubleKey, covert_msg: &[u8], q: &BigUint) 
     let mut result = mac.finalize().into_bytes();
 
     let q_byte_len = (q.bits() as usize + 7) / 8;
+    let out_len = q_byte_len.saturating_mul(2).max(1);
     let mut hash_bytes = result.to_vec();
     result.zeroize();
 
-    // Chain HMAC invocations in counter mode for large q.
+    // Chain HMAC invocations in counter mode to produce a wide reduction input.
     let mut counter = 1u32;
-    while hash_bytes.len() < q_byte_len + 16 {
+    while hash_bytes.len() < out_len {
         let mut mac = HmacSha256::new_from_slice(&dk_bytes).expect("HMAC accepts any key length");
         mac.update(covert_msg);
         mac.update(&counter.to_be_bytes());
@@ -137,19 +136,9 @@ pub(crate) fn derive_randomness(dk: &DoubleKey, covert_msg: &[u8], q: &BigUint) 
 
     dk_bytes.zeroize();
 
-    let q_bytes = q.to_bytes_be();
-    let q_boxed = BoxedUint::from_be_slice_vartime(&q_bytes);
-    let q_nz = NonZero::new(q_boxed).expect("q must be non-zero");
-
-    let mut hash_boxed = BoxedUint::from_be_slice_vartime(&hash_bytes);
-    let mut r = hash_boxed.rem_vartime(&q_nz);
-    hash_boxed.zeroize();
+    let r = ct_scalar_from_bytes_mod_q(&hash_bytes, q)
+        .expect("q must be non-zero and representable");
     hash_bytes.zeroize();
-
-    if r.is_zero().into() {
-        // Keep PRF mapping deterministic while preserving ElGamal invariant r in [1, q-1].
-        r = BoxedUint::one_with_precision(r.bits_precision());
-    }
 
     r
 }
@@ -191,7 +180,7 @@ fn encrypt_with_boxed_randomness(pk: &PublicKey, m: &BigUint, r: &BoxedUint) -> 
 ///
 /// A vector of ciphertexts, each encrypting `normal_msg` and carrying one
 /// covert byte.  The vector length equals `covert_msg.len()`.
-pub fn aencrypt_stream(
+pub fn aencrypt_stream_legacy(
     pk: &PublicKey,
     dk: &DoubleKey,
     normal_msg: &[u8],
@@ -213,13 +202,13 @@ pub fn aencrypt_stream(
             let r = rng.gen_biguint_range(&one, &pk.params.q);
 
             // Compute c1 = g^r mod p
-            let c1 = pk.params.g.modpow(&r, &pk.params.p);
+            let c1 = crate::ct::ct_modpow_biguint(&pk.params.g, &r, &pk.params.p)?;
 
             // Compute shared secret = dk_pub^r mod p
-            let shared = dk.dk_pub.modpow(&r, &pk.params.p);
+            let shared = crate::ct::ct_modpow_biguint(&dk.dk_pub, &r, &pk.params.p)?;
 
             // Derive mask byte from the shared secret
-            let mask = shared_to_byte(&shared);
+            let mask = shared_to_byte(&shared, &pk.params.p);
 
             if mask == covert_byte {
                 // This r encodes our covert byte — encrypt with it
@@ -244,7 +233,7 @@ pub fn aencrypt_stream(
 }
 
 /// DH stream-mode encryption with per-ciphertext authenticated packets.
-pub fn aencrypt_stream_padded_authenticated(
+pub fn aencrypt_stream(
     pk: &PublicKey,
     dk: &DoubleKey,
     normal_msg: &[u8],
@@ -254,7 +243,7 @@ pub fn aencrypt_stream_padded_authenticated(
     max_tries_per_byte: Option<u32>,
 ) -> Result<Vec<Vec<u8>>> {
     let padded = pad_pkcs7(normal_msg, block_size)?;
-    let cts = aencrypt_stream(pk, dk, &padded, covert_msg, max_tries_per_byte)?;
+    let cts = aencrypt_stream_legacy(pk, dk, &padded, covert_msg, max_tries_per_byte)?;
     let block_size_u8 = u8::try_from(block_size).map_err(|_| {
         AnamorphError::InvalidParameter("block size must fit in one byte".into())
     })?;
@@ -262,15 +251,13 @@ pub fn aencrypt_stream_padded_authenticated(
     let mut packets = Vec::with_capacity(cts.len());
     for ct in cts {
         let ct_body = serialize_ciphertext_for_modulus(&ct, &pk.params.p)?;
-        let mut body = Vec::with_capacity(2 + ct_body.len());
-        body.push(SECURE_PACKET_DOMAIN_ANAMORPHIC_STREAM);
-        body.push(block_size_u8);
-        body.extend_from_slice(&ct_body);
-
-        let tag = generate_mac(mac_key, &body)?;
-        let mut packet = Vec::with_capacity(1 + body.len() + MAC_SIZE);
+        let mut packet = Vec::with_capacity(1 + 2 + ct_body.len() + MAC_SIZE);
         packet.push(SECURE_PACKET_VERSION);
-        packet.extend_from_slice(&body);
+        packet.push(SECURE_PACKET_DOMAIN_ANAMORPHIC_STREAM);
+        packet.push(block_size_u8);
+        packet.extend_from_slice(&ct_body);
+
+        let tag = generate_mac(mac_key, &packet)?;
         packet.extend_from_slice(&tag);
         packets.push(packet);
     }
@@ -291,8 +278,8 @@ pub fn aencrypt_stream_padded_authenticated(
 /// Returns `(ciphertext, covert_encrypted_bytes)` where the encrypted
 /// bytes must be transmitted alongside the ciphertext.
 ///
-/// The receiver decrypts with [`super::decrypt::adecrypt_xor`].
-pub fn aencrypt_xor(
+/// The receiver decrypts with [`super::decrypt::adecrypt_xor_legacy`].
+pub fn aencrypt_xor_legacy(
     pk: &PublicKey,
     dk: &DoubleKey,
     normal_msg: &[u8],
@@ -306,10 +293,10 @@ pub fn aencrypt_xor(
     let ct = encrypt_with_randomness(pk, &m_normal, &r)?;
 
     // Compute shared secret: dk_pub^r = g^(dk·r) mod p
-    let shared = dk.dk_pub.modpow(&r, &pk.params.p);
+    let shared = crate::ct::ct_modpow_biguint(&dk.dk_pub, &r, &pk.params.p)?;
 
     // Derive keystream from the shared secret
-    let keystream = derive_keystream(&shared, covert_msg.len());
+    let keystream = derive_keystream(&shared, covert_msg.len(), &pk.params.p);
 
     // XOR covert message with keystream
     let covert_encrypted: Vec<u8> = covert_msg
@@ -322,7 +309,7 @@ pub fn aencrypt_xor(
 }
 
 /// DH XOR-mode encryption with authenticated packet wrapping.
-pub fn aencrypt_xor_padded_authenticated(
+pub fn aencrypt_xor(
     pk: &PublicKey,
     dk: &DoubleKey,
     normal_msg: &[u8],
@@ -331,7 +318,7 @@ pub fn aencrypt_xor_padded_authenticated(
     block_size: usize,
 ) -> Result<Vec<u8>> {
     let padded = pad_pkcs7(normal_msg, block_size)?;
-    let (ct, covert_encrypted) = aencrypt_xor(pk, dk, &padded, covert_msg)?;
+    let (ct, covert_encrypted) = aencrypt_xor_legacy(pk, dk, &padded, covert_msg)?;
     let ct_body = serialize_ciphertext_for_modulus(&ct, &pk.params.p)?;
     let block_size_u8 = u8::try_from(block_size).map_err(|_| {
         AnamorphError::InvalidParameter("block size must fit in one byte".into())
@@ -340,17 +327,15 @@ pub fn aencrypt_xor_padded_authenticated(
         AnamorphError::InvalidParameter("covert payload too large".into())
     })?;
 
-    let mut body = Vec::with_capacity(2 + ct_body.len() + 4 + covert_encrypted.len());
-    body.push(SECURE_PACKET_DOMAIN_ANAMORPHIC_XOR);
-    body.push(block_size_u8);
-    body.extend_from_slice(&ct_body);
-    body.extend_from_slice(&covert_len.to_be_bytes());
-    body.extend_from_slice(&covert_encrypted);
-
-    let tag = generate_mac(mac_key, &body)?;
-    let mut packet = Vec::with_capacity(1 + body.len() + MAC_SIZE);
+    let mut packet = Vec::with_capacity(1 + 2 + ct_body.len() + 4 + covert_encrypted.len() + MAC_SIZE);
     packet.push(SECURE_PACKET_VERSION);
-    packet.extend_from_slice(&body);
+    packet.push(SECURE_PACKET_DOMAIN_ANAMORPHIC_XOR);
+    packet.push(block_size_u8);
+    packet.extend_from_slice(&ct_body);
+    packet.extend_from_slice(&covert_len.to_be_bytes());
+    packet.extend_from_slice(&covert_encrypted);
+
+    let tag = generate_mac(mac_key, &packet)?;
     packet.extend_from_slice(&tag);
     Ok(packet)
 }
@@ -364,24 +349,35 @@ pub fn aencrypt_xor_padded_authenticated(
 /// Uses SHA-256 to hash the shared point and returns the first byte.
 /// This is the extraction function used by both sender (rejection sampling)
 /// and receiver (direct extraction).
-pub(crate) fn shared_to_byte(shared: &BigUint) -> u8 {
+pub(crate) fn shared_to_byte(shared: &BigUint, p: &BigUint) -> u8 {
     let mut shared_bytes = shared.to_bytes_be();
-    let hash = Sha256::digest(&shared_bytes);
+    let width = ((p.bits() + 7) / 8) as usize;
+    let mut padded = vec![0u8; width];
+    if shared_bytes.len() <= width {
+        padded[width - shared_bytes.len()..].copy_from_slice(&shared_bytes);
+    }
+    let hash = Sha256::digest(&padded);
     shared_bytes.zeroize();
+    padded.zeroize();
     hash[0]
 }
 
 /// Derive a keystream of `length` bytes from a DH shared secret.
 ///
 /// Uses SHA-256 in counter mode: `keystream[i..i+32] = SHA-256(shared || counter)`.
-pub(crate) fn derive_keystream(shared: &BigUint, length: usize) -> Vec<u8> {
+pub(crate) fn derive_keystream(shared: &BigUint, length: usize, p: &BigUint) -> Vec<u8> {
     let mut shared_bytes = shared.to_bytes_be();
+    let width = ((p.bits() + 7) / 8) as usize;
+    let mut padded = vec![0u8; width];
+    if shared_bytes.len() <= width {
+        padded[width - shared_bytes.len()..].copy_from_slice(&shared_bytes);
+    }
     let mut keystream = Vec::with_capacity(length);
     let mut counter = 0u32;
 
     while keystream.len() < length {
         let mut hasher = Sha256::new();
-        hasher.update(&shared_bytes);
+        hasher.update(&padded);
         hasher.update(&counter.to_be_bytes());
         let block = hasher.finalize();
         keystream.extend_from_slice(&block);
@@ -390,6 +386,7 @@ pub(crate) fn derive_keystream(shared: &BigUint, length: usize) -> Vec<u8> {
 
     keystream.truncate(length);
     shared_bytes.zeroize();
+    padded.zeroize();
     keystream
 }
 
@@ -397,7 +394,7 @@ pub(crate) fn derive_keystream(shared: &BigUint, length: usize) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::anamorphic::keygen::akeygen;
-    use crate::normal::decrypt::decrypt;
+    use crate::normal::decrypt::decrypt_legacy;
     use num_traits::{One, Zero};
 
     fn derive_randomness_raw_mod_q(dk: &DoubleKey, covert_msg: &[u8], q: &BigUint) -> BigUint {
@@ -432,24 +429,24 @@ mod tests {
         let normal_msg = b"hi";
         let covert_msg = b"sec";
 
-        let ct = aencrypt(&pk, &dk, normal_msg, covert_msg).expect("aencrypt");
-        let decrypted = decrypt(&sk, &ct).expect("decrypt");
+        let ct = aencrypt_legacy(&pk, &dk, normal_msg, covert_msg).expect("aencrypt");
+        let decrypted = decrypt_legacy(&sk, &ct).expect("decrypt");
         assert_eq!(decrypted, normal_msg.to_vec());
     }
 
     #[test]
     fn test_aencrypt_deterministic_with_same_inputs() {
         let (pk, _, dk) = akeygen(64).expect("akeygen");
-        let ct1 = aencrypt(&pk, &dk, b"hello", b"secret").expect("aencrypt1");
-        let ct2 = aencrypt(&pk, &dk, b"hello", b"secret").expect("aencrypt2");
+        let ct1 = aencrypt_legacy(&pk, &dk, b"hello", b"secret").expect("aencrypt1");
+        let ct2 = aencrypt_legacy(&pk, &dk, b"hello", b"secret").expect("aencrypt2");
         assert_eq!(ct1, ct2);
     }
 
     #[test]
     fn test_aencrypt_different_covert_different_ciphertext() {
         let (pk, _, dk) = akeygen(64).expect("akeygen");
-        let ct1 = aencrypt(&pk, &dk, b"hello", b"secret1").expect("aencrypt1");
-        let ct2 = aencrypt(&pk, &dk, b"hello", b"secret2").expect("aencrypt2");
+        let ct1 = aencrypt_legacy(&pk, &dk, b"hello", b"secret1").expect("aencrypt1");
+        let ct2 = aencrypt_legacy(&pk, &dk, b"hello", b"secret2").expect("aencrypt2");
         assert_ne!(ct1, ct2);
     }
 
@@ -490,10 +487,10 @@ mod tests {
     fn test_aencrypt_xor_normal_decrypt() {
         let (pk, sk, dk) = akeygen(64).expect("akeygen");
         let (ct, _covert_enc) =
-            aencrypt_xor(&pk, &dk, b"hi", b"covert payload").expect("aencrypt_xor");
+            aencrypt_xor_legacy(&pk, &dk, b"hi", b"covert payload").expect("aencrypt_xor");
 
         // Normal decryption still works
-        let decrypted = decrypt(&sk, &ct).expect("decrypt");
+        let decrypted = decrypt_legacy(&sk, &ct).expect("decrypt");
         assert_eq!(decrypted, b"hi".to_vec());
     }
 
@@ -503,11 +500,11 @@ mod tests {
         let covert_msg = b"arbitrary length covert message!";
 
         let (ct, covert_encrypted) =
-            aencrypt_xor(&pk, &dk, b"hi", covert_msg).expect("aencrypt_xor");
+            aencrypt_xor_legacy(&pk, &dk, b"hi", covert_msg).expect("aencrypt_xor");
 
         // Receiver computes shared secret: c1^dk mod p
         let shared = dk.shared_secret(&ct.c1, &pk.params.p);
-        let keystream = derive_keystream(&shared, covert_msg.len());
+        let keystream = derive_keystream(&shared, covert_msg.len(), &pk.params.p);
         let recovered: Vec<u8> = covert_encrypted
             .iter()
             .zip(keystream.iter())
@@ -522,15 +519,17 @@ mod tests {
     #[test]
     fn test_derive_keystream_length() {
         let shared = BigUint::from(12345u32);
-        let ks = derive_keystream(&shared, 100);
+        let p = BigUint::from(99999u32);
+        let ks = derive_keystream(&shared, 100, &p);
         assert_eq!(ks.len(), 100);
     }
 
     #[test]
     fn test_derive_keystream_deterministic() {
         let shared = BigUint::from(12345u32);
-        let ks1 = derive_keystream(&shared, 64);
-        let ks2 = derive_keystream(&shared, 64);
+        let p = BigUint::from(99999u32);
+        let ks1 = derive_keystream(&shared, 64, &p);
+        let ks2 = derive_keystream(&shared, 64, &p);
         assert_eq!(ks1, ks2);
     }
 }

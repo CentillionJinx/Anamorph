@@ -18,33 +18,31 @@ pub(crate) fn verify_and_extract_packet_body<'a>(
     mac_key: &[u8],
     expected_domain: u8,
 ) -> Result<&'a [u8]> {
-    let min_len = 2 + MAC_SIZE;
+    let min_len = 1 + 2 + MAC_SIZE; // version, domain, block_size, mac
     if packet.len() < min_len {
         return Err(AnamorphError::DecryptionFailed(
             "packet too short".into(),
         ));
     }
 
-    if packet[0] != super::encrypt::SECURE_PACKET_VERSION {
+    let msg_len = packet.len() - MAC_SIZE;
+    let (msg, tag_bytes) = packet.split_at(msg_len);
+
+    // Authenticate the entire packet (including version) first!
+    verify_mac(mac_key, msg, tag_bytes)?;
+
+    if msg[0] != super::encrypt::SECURE_PACKET_VERSION {
         return Err(AnamorphError::DecryptionFailed(
             "unsupported secure packet version".into(),
         ));
     }
 
-    let body_with_tag = &packet[1..];
-    let body_len = body_with_tag
-        .len()
-        .checked_sub(MAC_SIZE)
-        .ok_or_else(|| AnamorphError::DecryptionFailed("packet missing tag".into()))?;
-
-    let (body, tag_bytes) = body_with_tag.split_at(body_len);
-    if body.first().copied() != Some(expected_domain) {
+    let body = &msg[1..];
+    if body[0] != expected_domain {
         return Err(AnamorphError::DecryptionFailed(
             "unexpected secure packet domain".into(),
         ));
     }
-
-    verify_mac(mac_key, body, tag_bytes)?;
     Ok(body)
 }
 
@@ -58,13 +56,13 @@ pub(crate) fn verify_and_extract_packet_body<'a>(
 /// 4. Decode `m` back to bytes.
 ///
 /// Returns the original plaintext bytes.
-pub fn decrypt(sk: &SecretKey, ct: &Ciphertext) -> Result<Vec<u8>> {
+pub fn decrypt_legacy(sk: &SecretKey, ct: &Ciphertext) -> Result<Vec<u8>> {
     let m = decrypt_to_element(sk, ct)?;
     decode_message(&m)
 }
 
-/// Decrypt a packet produced by [`super::encrypt::encrypt_padded_authenticated`].
-pub fn decrypt_padded_authenticated(
+/// Decrypt a packet produced by [`super::encrypt::encrypt`].
+pub fn decrypt(
     sk: &SecretKey,
     packet: &[u8],
     mac_key: &[u8],
@@ -78,7 +76,7 @@ pub fn decrypt_padded_authenticated(
         AnamorphError::DecryptionFailed("secure packet missing block size".into())
     })? as usize;
     let ct = deserialize_ciphertext_for_modulus(&body[2..], &sk.params.p)?;
-    let padded = decrypt(sk, &ct)?;
+    let padded = decrypt_legacy(sk, &ct)?;
     unpad_pkcs7(&padded, block_size)
 }
 
@@ -94,10 +92,10 @@ pub fn decrypt_to_element(sk: &SecretKey, ct: &Ciphertext) -> Result<BigUint> {
 
     // s_inv = s^{p-2} mod p  (by Fermat's little theorem, since p is prime)
     let p_minus_2 = p - BigUint::from(2u32);
-    let s_inv = s.modpow(&p_minus_2, p);
+    let s_inv = crate::ct::ct_modpow_biguint(&s, &p_minus_2, p)?;
 
-    // m = c2 * s_inv mod p
-    let m = (&ct.c2 * &s_inv) % p;
+    // Use constant-time modular multiplication to protect the secret `s_inv`
+    let m = crate::ct::ct_mul_mod_biguint(&ct.c2, &s_inv, p)?;
 
     if m.is_zero() || m == BigUint::one() {
         // Sanity check — valid encoded messages have the 0x01 prefix,
@@ -135,16 +133,16 @@ pub(crate) fn deserialize_ciphertext_for_modulus(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::normal::encrypt::encrypt_legacy;
     use crate::normal::encrypt::encrypt;
-    use crate::normal::encrypt::encrypt_padded_authenticated;
     use crate::normal::keygen::keygen;
 
     #[test]
     fn test_decrypt_roundtrip() {
         let (pk, sk) = keygen(64).expect("keygen");
         let msg = b"Hi!";
-        let ct = encrypt(&pk, msg).expect("encrypt");
-        let decrypted = decrypt(&sk, &ct).expect("decrypt");
+        let ct = encrypt_legacy(&pk, msg).expect("encrypt");
+        let decrypted = decrypt_legacy(&sk, &ct).expect("decrypt");
         assert_eq!(decrypted, msg);
     }
 
@@ -152,8 +150,8 @@ mod tests {
     fn test_decrypt_empty_message() {
         let (pk, sk) = keygen(64).expect("keygen");
         let msg = b"";
-        let ct = encrypt(&pk, msg).expect("encrypt");
-        let decrypted = decrypt(&sk, &ct).expect("decrypt");
+        let ct = encrypt_legacy(&pk, msg).expect("encrypt");
+        let decrypted = decrypt_legacy(&sk, &ct).expect("decrypt");
         assert_eq!(decrypted, msg.to_vec());
     }
 
@@ -161,8 +159,8 @@ mod tests {
     fn test_decrypt_binary_data() {
         let (pk, sk) = keygen(64).expect("keygen");
         let msg: Vec<u8> = (0u8..5).collect();
-        let ct = encrypt(&pk, &msg).expect("encrypt");
-        let decrypted = decrypt(&sk, &ct).expect("decrypt");
+        let ct = encrypt_legacy(&pk, &msg).expect("encrypt");
+        let decrypted = decrypt_legacy(&sk, &ct).expect("decrypt");
         assert_eq!(decrypted, msg);
     }
 
@@ -171,10 +169,10 @@ mod tests {
         let (pk, _sk) = keygen(64).expect("keygen");
         let (_, wrong_sk) = keygen(64).expect("keygen2");
         let msg = b"secret";
-        let ct = encrypt(&pk, msg).expect("encrypt");
+        let ct = encrypt_legacy(&pk, msg).expect("encrypt");
         // Decrypting with the wrong key should produce garbage, not the original message
         // (it might not error, but the decoded message will differ)
-        let result = decrypt(&wrong_sk, &ct);
+        let result = decrypt_legacy(&wrong_sk, &ct);
         match result {
             Ok(decrypted) => assert_ne!(decrypted, msg.to_vec()),
             Err(_) => {} // Also acceptable — decoding may fail
@@ -185,13 +183,13 @@ mod tests {
     fn test_secure_packet_rejects_tampered_tag() {
         let (pk, sk) = keygen(128).expect("keygen");
         let mac_key = b"0123456789abcdef";
-        let mut packet = encrypt_padded_authenticated(&pk, b"ok", mac_key, 8)
+        let mut packet = encrypt(&pk, b"ok", mac_key, 8)
             .expect("secure encrypt");
 
         let last = packet.len() - 1;
         packet[last] ^= 0x01;
 
-        let result = decrypt_padded_authenticated(&sk, &packet, mac_key);
+        let result = decrypt(&sk, &packet, mac_key);
         assert!(matches!(result, Err(AnamorphError::IntegrityError)));
     }
 }

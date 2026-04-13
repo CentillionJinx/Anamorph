@@ -8,5 +8,5 @@ pub mod encrypt;
 pub mod decrypt;
 
 pub use keygen::{keygen, PublicKey, SecretKey};
-pub use encrypt::{encrypt, encrypt_padded_authenticated, Ciphertext};
-pub use decrypt::{decrypt, decrypt_padded_authenticated};
+pub use encrypt::{encrypt_legacy, encrypt, Ciphertext};
+pub use decrypt::{decrypt_legacy, decrypt};

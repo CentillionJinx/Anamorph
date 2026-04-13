@@ -8,11 +8,26 @@
 //! the normal-mode ciphertext even under full key extraction.
 
 use anamorph::anamorphic::{
-    akeygen, aencrypt, adecrypt, aencrypt_xor, adecrypt_xor, aencrypt_stream, adecrypt_stream,
+    adecrypt_legacy,
+    adecrypt,
+    adecrypt_stream_legacy,
+    adecrypt_stream,
+    adecrypt_xor_legacy,
+    adecrypt_xor,
+    aencrypt_legacy,
+    aencrypt,
+    aencrypt_stream_legacy,
+    aencrypt_stream,
+    aencrypt_xor_legacy,
+    aencrypt_xor,
+    akeygen,
 };
 use anamorph::anamorphic::decrypt::verify_covert_presence;
-use anamorph::normal::{encrypt, decrypt};
+use anamorph::normal::{decrypt, decrypt_legacy, encrypt_legacy};
 use num_bigint::BigUint;
+
+const TEST_MAC_KEY: &[u8] = b"0123456789abcdef";
+const TEST_BLOCK_SIZE: usize = 8;
 
 // =========================================================================
 // Type-1 Coercion: Adversary extracts the receiver's secret key
@@ -28,10 +43,10 @@ fn test_type1_prf_mode() {
     let normal_msg = b"inn";
     let covert_msg = b"res";
 
-    let ct = aencrypt(&pk, &dk, normal_msg, covert_msg).expect("aencrypt");
+    let ct = aencrypt_legacy(&pk, &dk, normal_msg, covert_msg).expect("aencrypt");
 
     // === Adversary's view (has sk, does NOT have dk) ===
-    let adversary_view = decrypt(&sk, &ct).expect("adversary decrypt");
+    let adversary_view = decrypt_legacy(&sk, &ct).expect("adversary decrypt");
     assert_eq!(adversary_view, normal_msg.to_vec(),
         "adversary should see the normal message");
 
@@ -40,7 +55,7 @@ fn test_type1_prf_mode() {
     // without dk.
 
     // === Legitimate receiver's view (has sk AND dk) ===
-    let receiver_view = adecrypt(&sk, &dk, &ct, covert_msg).expect("receiver adecrypt");
+    let receiver_view = adecrypt_legacy(&sk, &dk, &ct, covert_msg).expect("receiver adecrypt");
     assert_eq!(receiver_view.normal_msg, normal_msg.to_vec());
     assert_eq!(receiver_view.covert_msg, Some(covert_msg.to_vec()),
         "receiver should recover the covert message");
@@ -56,11 +71,11 @@ fn test_type1_xor_mode() {
     let normal_msg = b"ok";
     let covert_msg = b"coordinates: 51N 0W";
 
-    let (ct, covert_enc) = aencrypt_xor(&pk, &dk, normal_msg, covert_msg)
+    let (ct, covert_enc) = aencrypt_xor_legacy(&pk, &dk, normal_msg, covert_msg)
         .expect("aencrypt_xor");
 
     // === Adversary's view ===
-    let adversary_normal = decrypt(&sk, &ct).expect("adversary decrypt");
+    let adversary_normal = decrypt_legacy(&sk, &ct).expect("adversary decrypt");
     assert_eq!(adversary_normal, normal_msg.to_vec());
 
     // The adversary sees `covert_enc` but cannot derive the keystream
@@ -72,7 +87,7 @@ fn test_type1_xor_mode() {
         "covert_enc should be encrypted, not plaintext");
 
     // === Legitimate receiver ===
-    let receiver_view = adecrypt_xor(&sk, &dk, &ct, &covert_enc)
+    let receiver_view = adecrypt_xor_legacy(&sk, &dk, &ct, &covert_enc)
         .expect("receiver adecrypt_xor");
     assert_eq!(receiver_view.normal_msg, normal_msg.to_vec());
     assert_eq!(receiver_view.covert_msg, Some(covert_msg.to_vec()));
@@ -89,13 +104,13 @@ fn test_type1_stream_mode() {
     let normal_msg = b"ok";
     let covert_msg = vec![0x42_u8, 0x00, 0xFF];
 
-    let cts = aencrypt_stream(&pk, &dk, normal_msg, &covert_msg, Some(131072))
+    let cts = aencrypt_stream_legacy(&pk, &dk, normal_msg, &covert_msg, Some(131072))
         .expect("aencrypt_stream");
 
     // === Adversary's view ===
     // All ciphertexts decrypt to the normal message.
     for (i, ct) in cts.iter().enumerate() {
-        let adversary_normal = decrypt(&sk, ct).expect(&format!("adversary decrypt ct[{i}]"));
+        let adversary_normal = decrypt_legacy(&sk, ct).expect(&format!("adversary decrypt ct[{i}]"));
         assert_eq!(adversary_normal, normal_msg.to_vec(),
             "adversary should see normal message in ct[{i}]");
     }
@@ -104,7 +119,7 @@ fn test_type1_stream_mode() {
     // encryptions of the same message (could be normal retransmission).
 
     // === Legitimate receiver ===
-    let receiver_view = adecrypt_stream(&sk, &dk, &cts).expect("receiver adecrypt_stream");
+    let receiver_view = adecrypt_stream_legacy(&sk, &dk, &cts).expect("receiver adecrypt_stream");
     assert_eq!(receiver_view.normal_msg, normal_msg.to_vec());
     assert_eq!(receiver_view.covert_msg, Some(covert_msg));
 }
@@ -128,18 +143,18 @@ fn test_type2_prf_mode() {
     let covert_msg = b"SOS";
 
     // Sender complies with the dictated message but also embeds covert
-    let ct = aencrypt(&pk, &dk, dictated_msg, covert_msg).expect("aencrypt");
+    let ct = aencrypt_legacy(&pk, &dk, dictated_msg, covert_msg).expect("aencrypt");
 
     // === Adversary verification ===
     // The adversary decrypts and sees the dictated message
-    let adversary_view = decrypt(&sk, &ct).expect("adversary decrypt");
+    let adversary_view = decrypt_legacy(&sk, &ct).expect("adversary decrypt");
     assert_eq!(adversary_view, dictated_msg.to_vec(),
         "ciphertext must decrypt to the dictated message");
 
     // The adversary is satisfied — the sender appears to have complied.
 
     // === Receiver extraction ===
-    let receiver_view = adecrypt(&sk, &dk, &ct, covert_msg).expect("adecrypt");
+    let receiver_view = adecrypt_legacy(&sk, &dk, &ct, covert_msg).expect("adecrypt");
     assert_eq!(receiver_view.normal_msg, dictated_msg.to_vec());
     assert_eq!(receiver_view.covert_msg, Some(covert_msg.to_vec()),
         "covert message is recoverable despite Type-2 coercion");
@@ -155,15 +170,15 @@ fn test_type2_xor_mode() {
     let dictated_msg = b"ok";
     let covert_msg = b"HELP: agent compromised at location X";
 
-    let (ct, covert_enc) = aencrypt_xor(&pk, &dk, dictated_msg, covert_msg)
+    let (ct, covert_enc) = aencrypt_xor_legacy(&pk, &dk, dictated_msg, covert_msg)
         .expect("aencrypt_xor");
 
     // Adversary sees the dictated message
-    let adversary_view = decrypt(&sk, &ct).expect("adversary decrypt");
+    let adversary_view = decrypt_legacy(&sk, &ct).expect("adversary decrypt");
     assert_eq!(adversary_view, dictated_msg.to_vec());
 
     // Receiver recovers covert
-    let receiver_view = adecrypt_xor(&sk, &dk, &ct, &covert_enc)
+    let receiver_view = adecrypt_xor_legacy(&sk, &dk, &ct, &covert_enc)
         .expect("adecrypt_xor");
     assert_eq!(receiver_view.covert_msg, Some(covert_msg.to_vec()));
 }
@@ -183,14 +198,14 @@ fn test_cross_mode_indistinguishability() {
     let msg = b"msg";
 
     // Normal encryption
-    let normal_ct = encrypt(&pk, msg).expect("normal encrypt");
+    let normal_ct = encrypt_legacy(&pk, msg).expect("normal encrypt");
 
     // PRF anamorphic encryption
-    let prf_ct = aencrypt(&pk, &dk, msg, b"cov").expect("prf encrypt");
+    let prf_ct = aencrypt_legacy(&pk, &dk, msg, b"cov").expect("prf encrypt");
 
     // Both decrypt to the same normal message
-    let normal_dec = decrypt(&sk, &normal_ct).expect("normal decrypt");
-    let prf_dec = decrypt(&sk, &prf_ct).expect("prf decrypt");
+    let normal_dec = decrypt_legacy(&sk, &normal_ct).expect("normal decrypt");
+    let prf_dec = decrypt_legacy(&sk, &prf_ct).expect("prf decrypt");
     assert_eq!(normal_dec, prf_dec);
     assert_eq!(normal_dec, msg.to_vec());
 
@@ -209,14 +224,14 @@ fn test_presence_check_soundness() {
     let covert = b"test";
 
     // Anamorphic ciphertext — should verify
-    let anamorphic_ct = aencrypt(&pk, &dk, b"msg", covert).expect("aencrypt");
+    let anamorphic_ct = aencrypt_legacy(&pk, &dk, b"msg", covert).expect("aencrypt");
     assert!(verify_covert_presence(
         &dk, &anamorphic_ct, covert,
         &pk.params.p, &pk.params.q, &pk.params.g
     ));
 
     // Normal ciphertext — should NOT verify (overwhelming probability)
-    let normal_ct = encrypt(&pk, b"msg").expect("encrypt");
+    let normal_ct = encrypt_legacy(&pk, b"msg").expect("encrypt");
     assert!(!verify_covert_presence(
         &dk, &normal_ct, covert,
         &pk.params.p, &pk.params.q, &pk.params.g
@@ -232,8 +247,8 @@ fn test_presence_check_soundness() {
 #[test]
 fn test_prf_determinism() {
     let (pk, _, dk) = akeygen(64).expect("akeygen");
-    let ct1 = aencrypt(&pk, &dk, b"msg", b"cov").expect("enc1");
-    let ct2 = aencrypt(&pk, &dk, b"msg", b"cov").expect("enc2");
+    let ct1 = aencrypt_legacy(&pk, &dk, b"msg", b"cov").expect("enc1");
+    let ct2 = aencrypt_legacy(&pk, &dk, b"msg", b"cov").expect("enc2");
     assert_eq!(ct1, ct2, "PRF mode should be deterministic");
 }
 
@@ -253,7 +268,60 @@ fn test_different_dk_different_ct() {
     let dk2_pub = pk.params.g.modpow(&dk2_val, &pk.params.p);
     let dk2 = anamorph::anamorphic::DoubleKey { dk: dk2, dk_pub: dk2_pub };
 
-    let ct1 = aencrypt(&pk, &dk1, b"msg", b"cov").expect("enc1");
-    let ct2 = aencrypt(&pk, &dk2, b"msg", b"cov").expect("enc2");
+    let ct1 = aencrypt_legacy(&pk, &dk1, b"msg", b"cov").expect("enc1");
+    let ct2 = aencrypt_legacy(&pk, &dk2, b"msg", b"cov").expect("enc2");
     assert_ne!(ct1, ct2, "different dk should produce different ciphertexts");
+}
+
+/// Secure PRF packet path preserves coercion semantics while adding integrity.
+#[test]
+fn test_type1_prf_mode_secure_packet() {
+    let (pk, sk, dk) = akeygen(128).expect("akeygen");
+    let normal_msg = b"inn";
+    let covert_msg = b"res";
+
+    let packet = aencrypt(
+        &pk,
+        &dk,
+        normal_msg,
+        covert_msg,
+        TEST_MAC_KEY,
+        TEST_BLOCK_SIZE,
+    )
+    .expect("secure aencrypt");
+
+    let adversary_view = decrypt(&sk, &packet, TEST_MAC_KEY);
+    assert!(adversary_view.is_err(), "normal decryptor must reject anamorphic packet domain");
+
+    let receiver_view = adecrypt(&sk, &dk, &packet, TEST_MAC_KEY, covert_msg)
+        .expect("secure adecrypt");
+    assert_eq!(receiver_view.normal_msg, normal_msg.to_vec());
+    assert_eq!(receiver_view.covert_msg, Some(covert_msg.to_vec()));
+}
+
+/// Secure stream and XOR packet paths remain decryptable by the legitimate receiver.
+#[test]
+fn test_secure_stream_and_xor_roundtrip() {
+    let (pk, sk, dk) = akeygen(128).expect("akeygen");
+
+    let stream_packets = aencrypt_stream(
+        &pk, &dk, b"ok", &[0x42_u8],
+        TEST_MAC_KEY, TEST_BLOCK_SIZE,
+        Some(131072),
+    )
+    .expect("secure stream encrypt");
+    let stream_plain = adecrypt_stream(&sk, &dk, &stream_packets, TEST_MAC_KEY)
+        .expect("secure stream decrypt");
+    assert_eq!(stream_plain.normal_msg, b"ok".to_vec());
+    assert_eq!(stream_plain.covert_msg, Some(vec![0x42_u8]));
+
+    let xor_packet = aencrypt_xor(
+        &pk, &dk, b"ok", b"hidden",
+        TEST_MAC_KEY, TEST_BLOCK_SIZE,
+    )
+    .expect("secure xor encrypt");
+    let xor_plain = adecrypt_xor(&sk, &dk, &xor_packet, TEST_MAC_KEY)
+        .expect("secure xor decrypt");
+    assert_eq!(xor_plain.normal_msg, b"ok".to_vec());
+    assert_eq!(xor_plain.covert_msg, Some(b"hidden".to_vec()));
 }

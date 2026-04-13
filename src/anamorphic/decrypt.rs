@@ -13,9 +13,10 @@
 
 use num_bigint::BigUint;
 
+use crate::ct::{ct_eq_biguint_fixed, ct_modpow_boxed};
 use crate::errors::{AnamorphError, Result};
 use crate::normal::decrypt::{
-    decrypt,
+    decrypt_legacy,
     deserialize_ciphertext_for_modulus,
     verify_and_extract_packet_body,
 };
@@ -46,19 +47,19 @@ pub struct AnamorphicPlaintext {
 ///
 /// Returns `AnamorphicPlaintext` with `covert_msg = Some(...)` if the
 /// candidate matches, or `None` otherwise.
-pub fn adecrypt(
+pub fn adecrypt_legacy(
     sk: &SecretKey,
     dk: &DoubleKey,
     ct: &Ciphertext,
     candidate_covert: &[u8],
 ) -> Result<AnamorphicPlaintext> {
-    let normal_msg = decrypt(sk, ct)?;
+    let normal_msg = decrypt_legacy(sk, ct)?;
 
     let r = derive_randomness(dk, candidate_covert, &sk.params.q);
-    let r_big = BigUint::from_bytes_be(&r.to_be_bytes());
-    let expected_c1 = sk.params.g.modpow(&r_big, &sk.params.p);
+    let expected_c1 = ct_modpow_boxed(&sk.params.g, &r, &sk.params.p)?;
+    let width = ((sk.params.p.bits() + 7) / 8) as usize;
 
-    let covert_msg = if expected_c1 == ct.c1 {
+    let covert_msg = if bool::from(ct_eq_biguint_fixed(&expected_c1, &ct.c1, width)) {
         Some(candidate_covert.to_vec())
     } else {
         None
@@ -71,7 +72,7 @@ pub fn adecrypt(
 }
 
 /// PRF-mode decryption for authenticated padded packets.
-pub fn adecrypt_padded_authenticated(
+pub fn adecrypt(
     sk: &SecretKey,
     dk: &DoubleKey,
     packet: &[u8],
@@ -87,7 +88,7 @@ pub fn adecrypt_padded_authenticated(
         AnamorphError::DecryptionFailed("secure packet missing block size".into())
     })? as usize;
     let ct = deserialize_ciphertext_for_modulus(&body[2..], &sk.params.p)?;
-    let mut plaintext = adecrypt(sk, dk, &ct, candidate_covert)?;
+    let mut plaintext = adecrypt_legacy(sk, dk, &ct, candidate_covert)?;
     plaintext.normal_msg = unpad_pkcs7(&plaintext.normal_msg, block_size)?;
     Ok(plaintext)
 }
@@ -102,14 +103,14 @@ pub fn adecrypt_search(
     ct: &Ciphertext,
     candidates: &[Vec<u8>],
 ) -> Result<AnamorphicPlaintext> {
-    let normal_msg = decrypt(sk, ct)?;
+    let normal_msg = decrypt_legacy(sk, ct)?;
+    let width = ((sk.params.p.bits() + 7) / 8) as usize;
 
     for candidate in candidates {
         let r = derive_randomness(dk, candidate, &sk.params.q);
-        let r_big = BigUint::from_bytes_be(&r.to_be_bytes());
-        let expected_c1 = sk.params.g.modpow(&r_big, &sk.params.p);
+        let expected_c1 = ct_modpow_boxed(&sk.params.g, &r, &sk.params.p)?;
 
-        if expected_c1 == ct.c1 {
+        if bool::from(ct_eq_biguint_fixed(&expected_c1, &ct.c1, width)) {
             return Ok(AnamorphicPlaintext {
                 normal_msg,
                 covert_msg: Some(candidate.clone()),
@@ -145,7 +146,7 @@ pub fn adecrypt_search(
 ///
 /// `AnamorphicPlaintext` with the normal message and the reassembled
 /// covert message.
-pub fn adecrypt_stream(
+pub fn adecrypt_stream_legacy(
     sk: &SecretKey,
     dk: &DoubleKey,
     cts: &[Ciphertext],
@@ -159,13 +160,13 @@ pub fn adecrypt_stream(
     }
 
     // Decrypt normal message from the first ciphertext.
-    let normal_msg = decrypt(sk, &cts[0])?;
+    let normal_msg = decrypt_legacy(sk, &cts[0])?;
 
     // Extract one covert byte per ciphertext.
     let mut covert_bytes = Vec::with_capacity(cts.len());
     for ct in cts {
         let shared = dk.shared_secret(&ct.c1, &sk.params.p);
-        let covert_byte = shared_to_byte(&shared);
+        let covert_byte = shared_to_byte(&shared, &sk.params.p);
         covert_bytes.push(covert_byte);
     }
 
@@ -176,7 +177,7 @@ pub fn adecrypt_stream(
 }
 
 /// DH stream-mode decryption for authenticated padded packets.
-pub fn adecrypt_stream_padded_authenticated(
+pub fn adecrypt_stream(
     sk: &SecretKey,
     dk: &DoubleKey,
     packets: &[Vec<u8>],
@@ -216,7 +217,7 @@ pub fn adecrypt_stream_padded_authenticated(
         cts.push(ct);
     }
 
-    let mut plaintext = adecrypt_stream(sk, dk, &cts)?;
+    let mut plaintext = adecrypt_stream_legacy(sk, dk, &cts)?;
     if let Some(bs) = block_size {
         plaintext.normal_msg = unpad_pkcs7(&plaintext.normal_msg, bs)?;
     }
@@ -240,19 +241,19 @@ pub fn adecrypt_stream_padded_authenticated(
 /// - `dk` — shared double key
 /// - `ct` — the ciphertext
 /// - `covert_encrypted` — the XOR-encrypted covert bytes (transmitted alongside `ct`)
-pub fn adecrypt_xor(
+pub fn adecrypt_xor_legacy(
     sk: &SecretKey,
     dk: &DoubleKey,
     ct: &Ciphertext,
     covert_encrypted: &[u8],
 ) -> Result<AnamorphicPlaintext> {
-    let normal_msg = decrypt(sk, ct)?;
+    let normal_msg = decrypt_legacy(sk, ct)?;
 
     // Compute shared secret: c1^dk mod p
     let shared = dk.shared_secret(&ct.c1, &sk.params.p);
 
     // Derive keystream and XOR to recover covert message
-    let keystream = derive_keystream(&shared, covert_encrypted.len());
+    let keystream = derive_keystream(&shared, covert_encrypted.len(), &sk.params.p);
     let covert_msg: Vec<u8> = covert_encrypted
         .iter()
         .zip(keystream.iter())
@@ -266,7 +267,7 @@ pub fn adecrypt_xor(
 }
 
 /// DH XOR-mode decryption for authenticated padded packets.
-pub fn adecrypt_xor_padded_authenticated(
+pub fn adecrypt_xor(
     sk: &SecretKey,
     dk: &DoubleKey,
     packet: &[u8],
@@ -300,7 +301,7 @@ pub fn adecrypt_xor_padded_authenticated(
         ));
     }
 
-    let mut plaintext = adecrypt_xor(sk, dk, &ct, covert_encrypted)?;
+    let mut plaintext = adecrypt_xor_legacy(sk, dk, &ct, covert_encrypted)?;
     plaintext.normal_msg = unpad_pkcs7(&plaintext.normal_msg, block_size)?;
     Ok(plaintext)
 }
@@ -322,9 +323,12 @@ pub fn verify_covert_presence(
     g: &BigUint,
 ) -> bool {
     let r = derive_randomness(dk, candidate_covert, q);
-    let r_big = BigUint::from_bytes_be(&r.to_be_bytes());
-    let expected_c1 = g.modpow(&r_big, p);
-    expected_c1 == ct.c1
+    let expected_c1 = match ct_modpow_boxed(g, &r, p) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let width = ((p.bits() + 7) / 8) as usize;
+    bool::from(ct_eq_biguint_fixed(&expected_c1, &ct.c1, width))
 }
 
 // =========================================================================
@@ -335,12 +339,12 @@ pub fn verify_covert_presence(
 mod tests {
     use super::*;
     use crate::anamorphic::encrypt::{
+        aencrypt_legacy,
         aencrypt,
-        aencrypt_padded_authenticated,
+        aencrypt_stream_legacy,
         aencrypt_stream,
-        aencrypt_stream_padded_authenticated,
+        aencrypt_xor_legacy,
         aencrypt_xor,
-        aencrypt_xor_padded_authenticated,
     };
     use crate::anamorphic::keygen::akeygen;
 
@@ -349,8 +353,8 @@ mod tests {
     #[test]
     fn test_adecrypt_recovers_both_messages() {
         let (pk, sk, dk) = akeygen(64).expect("akeygen");
-        let ct = aencrypt(&pk, &dk, b"vis", b"hid").expect("aencrypt");
-        let result = adecrypt(&sk, &dk, &ct, b"hid").expect("adecrypt");
+        let ct = aencrypt_legacy(&pk, &dk, b"vis", b"hid").expect("aencrypt");
+        let result = adecrypt_legacy(&sk, &dk, &ct, b"hid").expect("adecrypt");
         assert_eq!(result.normal_msg, b"vis".to_vec());
         assert_eq!(result.covert_msg, Some(b"hid".to_vec()));
     }
@@ -358,8 +362,8 @@ mod tests {
     #[test]
     fn test_adecrypt_wrong_candidate_returns_none() {
         let (pk, sk, dk) = akeygen(64).expect("akeygen");
-        let ct = aencrypt(&pk, &dk, b"norm", b"sec").expect("aencrypt");
-        let result = adecrypt(&sk, &dk, &ct, b"wrong").expect("adecrypt");
+        let ct = aencrypt_legacy(&pk, &dk, b"norm", b"sec").expect("aencrypt");
+        let result = adecrypt_legacy(&sk, &dk, &ct, b"wrong").expect("adecrypt");
         assert_eq!(result.normal_msg, b"norm".to_vec());
         assert_eq!(result.covert_msg, None);
     }
@@ -367,7 +371,7 @@ mod tests {
     #[test]
     fn test_adecrypt_search_finds_covert() {
         let (pk, sk, dk) = akeygen(64).expect("akeygen");
-        let ct = aencrypt(&pk, &dk, b"hi", b"tgt").expect("aencrypt");
+        let ct = aencrypt_legacy(&pk, &dk, b"hi", b"tgt").expect("aencrypt");
         let candidates: Vec<Vec<u8>> = vec![
             b"w1".to_vec(),
             b"w2".to_vec(),
@@ -384,11 +388,11 @@ mod tests {
     fn test_stream_roundtrip_single_byte() {
         let (pk, sk, dk) = akeygen(64).expect("akeygen");
         let covert = vec![0x42_u8];
-        let cts = aencrypt_stream(&pk, &dk, b"hi", &covert, Some(131072))
+        let cts = aencrypt_stream_legacy(&pk, &dk, b"hi", &covert, Some(131072))
             .expect("aencrypt_stream");
         assert_eq!(cts.len(), 1);
 
-        let result = adecrypt_stream(&sk, &dk, &cts).expect("adecrypt_stream");
+        let result = adecrypt_stream_legacy(&sk, &dk, &cts).expect("adecrypt_stream");
         assert_eq!(result.normal_msg, b"hi".to_vec());
         assert_eq!(result.covert_msg, Some(covert));
     }
@@ -398,23 +402,23 @@ mod tests {
         let (pk, sk, dk) = akeygen(64).expect("akeygen");
         // Use bytes that are not too rare in SHA-256 output
         let covert = vec![0x00_u8, 0xFF, 0x42];
-        let cts = aencrypt_stream(&pk, &dk, b"hi", &covert, Some(131072))
+        let cts = aencrypt_stream_legacy(&pk, &dk, b"hi", &covert, Some(131072))
             .expect("aencrypt_stream");
         assert_eq!(cts.len(), 3);
 
-        let result = adecrypt_stream(&sk, &dk, &cts).expect("adecrypt_stream");
+        let result = adecrypt_stream_legacy(&sk, &dk, &cts).expect("adecrypt_stream");
         assert_eq!(result.covert_msg, Some(covert));
     }
 
     #[test]
     fn test_stream_normal_decrypt_on_each_ct() {
         let (pk, sk, dk) = akeygen(64).expect("akeygen");
-        let cts = aencrypt_stream(&pk, &dk, b"hi", &[0x00], Some(131072))
+        let cts = aencrypt_stream_legacy(&pk, &dk, b"hi", &[0x00], Some(131072))
             .expect("aencrypt_stream");
 
         // Every ciphertext should decrypt to the same normal message
         for ct in &cts {
-            let decrypted = crate::normal::decrypt::decrypt(&sk, ct)
+            let decrypted = crate::normal::decrypt::decrypt_legacy(&sk, ct)
                 .expect("normal decrypt");
             assert_eq!(decrypted, b"hi".to_vec());
         }
@@ -427,10 +431,10 @@ mod tests {
         let (pk, sk, dk) = akeygen(64).expect("akeygen");
         let covert_msg = b"long covert msg!";
 
-        let (ct, covert_enc) = aencrypt_xor(&pk, &dk, b"hi", covert_msg)
+        let (ct, covert_enc) = aencrypt_xor_legacy(&pk, &dk, b"hi", covert_msg)
             .expect("aencrypt_xor");
 
-        let result = adecrypt_xor(&sk, &dk, &ct, &covert_enc)
+        let result = adecrypt_xor_legacy(&sk, &dk, &ct, &covert_enc)
             .expect("adecrypt_xor");
 
         assert_eq!(result.normal_msg, b"hi".to_vec());
@@ -441,10 +445,10 @@ mod tests {
     fn test_xor_empty_covert() {
         let (pk, sk, dk) = akeygen(64).expect("akeygen");
 
-        let (ct, covert_enc) = aencrypt_xor(&pk, &dk, b"hi", b"")
+        let (ct, covert_enc) = aencrypt_xor_legacy(&pk, &dk, b"hi", b"")
             .expect("aencrypt_xor");
 
-        let result = adecrypt_xor(&sk, &dk, &ct, &covert_enc)
+        let result = adecrypt_xor_legacy(&sk, &dk, &ct, &covert_enc)
             .expect("adecrypt_xor");
 
         assert_eq!(result.covert_msg, Some(Vec::new()));
@@ -455,7 +459,7 @@ mod tests {
     #[test]
     fn test_verify_covert_presence() {
         let (pk, _, dk) = akeygen(64).expect("akeygen");
-        let ct = aencrypt(&pk, &dk, b"norm", b"hid").expect("aencrypt");
+        let ct = aencrypt_legacy(&pk, &dk, b"norm", b"hid").expect("aencrypt");
 
         assert!(verify_covert_presence(
             &dk, &ct, b"hid",
@@ -471,7 +475,7 @@ mod tests {
     fn test_secure_prf_packet_roundtrip() {
         let (pk, sk, dk) = akeygen(128).expect("akeygen");
         let mac_key = b"0123456789abcdef";
-        let packet = aencrypt_padded_authenticated(
+        let packet = aencrypt(
             &pk,
             &dk,
             b"ok",
@@ -481,7 +485,7 @@ mod tests {
         )
         .expect("secure aencrypt");
 
-        let result = adecrypt_padded_authenticated(&sk, &dk, &packet, mac_key, b"hid")
+        let result = adecrypt(&sk, &dk, &packet, mac_key, b"hid")
             .expect("secure adecrypt");
         assert_eq!(result.normal_msg, b"ok".to_vec());
         assert_eq!(result.covert_msg, Some(b"hid".to_vec()));
@@ -492,7 +496,7 @@ mod tests {
         let (pk, sk, dk) = akeygen(128).expect("akeygen");
         let mac_key = b"0123456789abcdef";
         let covert = vec![0x42];
-        let packets = aencrypt_stream_padded_authenticated(
+        let packets = aencrypt_stream(
             &pk,
             &dk,
             b"ok",
@@ -503,7 +507,7 @@ mod tests {
         )
         .expect("secure stream encrypt");
 
-        let result = adecrypt_stream_padded_authenticated(&sk, &dk, &packets, mac_key)
+        let result = adecrypt_stream(&sk, &dk, &packets, mac_key)
             .expect("secure stream decrypt");
         assert_eq!(result.normal_msg, b"ok".to_vec());
         assert_eq!(result.covert_msg, Some(covert));
@@ -513,7 +517,7 @@ mod tests {
     fn test_secure_xor_packet_roundtrip() {
         let (pk, sk, dk) = akeygen(128).expect("akeygen");
         let mac_key = b"0123456789abcdef";
-        let packet = aencrypt_xor_padded_authenticated(
+        let packet = aencrypt_xor(
             &pk,
             &dk,
             b"ok",
@@ -523,7 +527,7 @@ mod tests {
         )
         .expect("secure xor encrypt");
 
-        let result = adecrypt_xor_padded_authenticated(&sk, &dk, &packet, mac_key)
+        let result = adecrypt_xor(&sk, &dk, &packet, mac_key)
             .expect("secure xor decrypt");
         assert_eq!(result.normal_msg, b"ok".to_vec());
         assert_eq!(result.covert_msg, Some(b"covert payload".to_vec()));

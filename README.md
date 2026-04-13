@@ -103,7 +103,7 @@ project-anamorph/
 │   ├── anamorphic_mode.rs
 │   ├── coercion_simulation.rs  # Type-1 and Type-2 coercion tests
 │   ├── indistinguishability.rs # proptest harness
-│   └── coercion_simulation.rs  # Type-1 and Type-2 coercion tests
+│   └── behavior_comparison.rs  # Legacy vs secure behavior and tampering comparisons
 ├── scripts/
 │   └── plot_benchmarks.py      # Python post-processing for Criterion output
 ├── Cargo.toml
@@ -219,7 +219,7 @@ All security-critical logic is in Rust. Python is used exclusively for benchmark
 
 > Full API documentation is available via `cargo doc --open`.
 
-### Normal Mode
+### Normal Mode (Secure Packet API)
 
 ```rust
 use anamorph::normal::{keygen, encrypt, decrypt};
@@ -227,15 +227,18 @@ use anamorph::normal::{keygen, encrypt, decrypt};
 // Key generation
 let (pk, sk) = keygen(2048)?;
 
-// Encrypt a plaintext message
-let ciphertext = encrypt(&pk, b"Hello, world!")?;
+let mac_key = b"0123456789abcdef";
+let block_size = 16;
+
+// Encrypt a plaintext message (PKCS#7 + HMAC packet)
+let packet = encrypt(&pk, b"Hello, world!", mac_key, block_size)?;
 
 // Decrypt
-let plaintext = decrypt(&sk, &ciphertext)?;
+let plaintext = decrypt(&sk, &packet, mac_key)?;
 assert_eq!(plaintext, b"Hello, world!");
 ```
 
-### Anamorphic Mode
+### Anamorphic Mode (Secure Packet API)
 
 ```rust
 use anamorph::anamorphic::{akeygen, aencrypt, adecrypt};
@@ -244,17 +247,27 @@ use anamorph::normal::decrypt;
 // Key generation — produces a public key and a double key
 let (pk, sk, dk) = akeygen(2048)?;
 
-// Encrypt normal message + covert message simultaneously
-let ciphertext = aencrypt(&pk, &dk, b"Normal message", b"Covert payload")?;
+let mac_key = b"0123456789abcdef";
+let block_size = 16;
+
+// Encrypt normal message + covert message into an authenticated packet
+let packet = aencrypt(
+   &pk, &dk,
+   b"Normal message", b"Covert payload",
+   mac_key, block_size,
+)?;
 
 // Normal decryption — adversary sees only the normal message
-let normal = decrypt(&sk, &ciphertext)?;
+let normal = decrypt(&sk, &packet, mac_key)?;
 assert_eq!(normal, b"Normal message");
 
 // Anamorphic decryption — trusted receiver recovers the covert payload
-let covert = adecrypt(&sk, &dk, &ciphertext)?;
-assert_eq!(covert, b"Covert payload");
+let decoded = adecrypt(&sk, &dk, &packet, mac_key, b"Covert payload")?;
+assert_eq!(decoded.covert_msg, Some(b"Covert payload".to_vec()));
 ```
+
+Legacy `encrypt`/`decrypt` and `aencrypt`/`adecrypt` are still available for
+baseline testing and side-by-side comparisons in the integration tests.
 
 ### Coercion Simulation
 
