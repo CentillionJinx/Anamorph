@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Unsynchronized Robustly Anamorphic ElGamal — COMP6453 Applied Cryptography Project"
 license = "MIT"
+autobenches = false
 
 [dependencies]
 # Cryptographic big integers and prime tooling (incremental migration path)
@@ -44,4 +45,20 @@ proptest = "1"
 
 [[bench]]
 name = "throughput"
+harness = false
+
+[[bench]]
+name = "core"
+harness = false
+
+[[bench]]
+name = "slow_setup"
+harness = false
+
+[[bench]]
+name = "slow_search"
+harness = false
+
+[[bench]]
+name = "slow_stream"
 harness = false
