@@ -7,10 +7,28 @@ pub const PARAM_BITS: usize = 2048;
 pub const NORMAL_MSG: &[u8] = b"normal benchmark payload";
 pub const BENCH_MAC_KEY: &[u8] = b"0123456789abcdef";
 pub const BENCH_BLOCK_SIZE: usize = 16;
-pub const PRF_COVERT_SIZES: [usize; 5] = [0, 1024, 4096, 16384, 65536];
-pub const PRF_LARGE_COVERT_SIZES: [usize; 2] = [262144, 1048576];
-pub const XOR_COVERT_SIZES: [usize; 6] = [0, 1024, 4096, 16384, 65536, 262144];
-pub const XOR_LARGE_COVERT_SIZES: [usize; 2] = [1048576, 4194304];
+pub const PRF_COVERT_SIZES: [usize; 7] = [0, 1024, 4096, 16384, 65536, 131072, 262144];
+pub const PRF_LARGE_COVERT_SIZES: [usize; 8] = [
+    393216,
+    524288,
+    786432,
+    1048576,
+    1310720,
+    1572864,
+    1835008,
+    2097152,
+];
+pub const XOR_COVERT_SIZES: [usize; 8] = [0, 1024, 4096, 16384, 65536, 131072, 262144, 524288];
+pub const XOR_LARGE_COVERT_SIZES: [usize; 8] = [
+    786432,
+    1048576,
+    1572864,
+    2097152,
+    2621440,
+    3145728,
+    3670016,
+    4194304,
+];
 pub const SEARCH_FAST_SET_SIZES: [usize; 3] = [1, 4, 16];
 pub const SEARCH_SLOW_SET_SIZES: [usize; 2] = [64, 256];
 pub const STREAM_COVERT_SIZES: [usize; 3] = [1, 4, 16];
@@ -100,6 +118,6 @@ pub fn apply_slow_search_group_config(group: &mut BenchmarkGroup<'_, WallTime>) 
 pub fn apply_slow_stream_group_config(group: &mut BenchmarkGroup<'_, WallTime>) {
     group.sample_size(10);
     group.sampling_mode(SamplingMode::Flat);
-    group.warm_up_time(Duration::from_secs(0));
+    group.warm_up_time(Duration::from_millis(1));
     group.measurement_time(Duration::from_secs(1));
 }
