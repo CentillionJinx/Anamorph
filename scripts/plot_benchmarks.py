@@ -156,6 +156,13 @@ def add_watermark(ax):
     ax.text(0.98, 0.02, "Project Anamorph", transform=ax.transAxes,
             fontsize=8, color=GRID_CLR, ha="right", va="bottom",
             fontstyle="italic", alpha=0.6)
+    
+def merge_series(*series_lists: list[list[dict]]) -> list[dict]:
+    """Merge multiple parameter series and sort by parameter value."""
+    merged = []
+    for series in series_lists:
+        merged.extend(series)
+    return sorted(merged, key=lambda x: x["param"] if isinstance(x["param"], int) else 0)
 
 
 # ── Figures ──────────────────────────────────────────────────────────────
@@ -500,6 +507,45 @@ def fig_robustness_controls(baselines: dict, out_dir: Path):
     fig.tight_layout()
     save_fig(fig, "08_robustness_controls", out_dir)
 
+def fig_prf_search_scaling(criterion_dir: Path, out_dir: Path):
+    """Plot candidate-set size vs PRF search latency."""
+    small = collect_group_data(criterion_dir, "anamorphic_prf_search_total_cost")
+    large = collect_group_data(criterion_dir, "anamorphic_prf_search_total_cost_large")
+    data = merge_series(small, large)
+
+    if not data:
+        return
+
+    xs = [int(d["param"]) for d in data]
+    ys = [ns_to_us(d["mean_ns"]) for d in data]
+    errs = [ns_to_us(d["stddev_ns"]) for d in data]
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    ax.errorbar(
+        xs, ys, yerr=errs,
+        color=PALETTE["search"],
+        marker="o",
+        linestyle="-",
+        linewidth=2,
+        markersize=6,
+        capsize=3,
+        label="PRF candidate search"
+    )
+
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("Candidate Set Size")
+    ax.set_ylabel("Time (µs)")
+    ax.set_title("PRF Candidate-Set Search Scaling")
+    ax.grid(True, linestyle="--")
+    ax.legend(loc="upper left", framealpha=0.9)
+
+    ax.xaxis.set_major_locator(ticker.FixedLocator(xs))
+    ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: str(int(x)) if x in xs else ""))
+
+    add_watermark(ax)
+    fig.tight_layout()
+    save_fig(fig, "09_prf_search_scaling", out_dir)
+
 
 # ── Main ─────────────────────────────────────────────────────────────────
 
@@ -524,6 +570,7 @@ def main():
     fig_ec24_primitives(baselines, out_dir)
     fig_keygen_comparison(criterion_dir, out_dir)
     fig_robustness_controls(baselines, out_dir)
+    fig_prf_search_scaling(criterion_dir, out_dir)
 
     print(f"\nDone. {len(list(out_dir.glob('*.png')))} figures generated.")
 

@@ -310,9 +310,22 @@ cargo test -- --nocapture
 
 ### Benchmarks
 
+The benchmark suite is split into three independent Criterion groups, each targeting a different operational category:
+
+| Suite | File | Description |
+| ----- |------|-------------|
+| **Core** | `benches/core.rs` | Main routine benchmarks measuring PRF and XOR anamorphic encryption/decryption across multiple covert payload sizes (1–256 bytes). Includes EC24 extensions (double key ratcheting, covert indicator verification) and normal-mode baselines. Runs in ~minutes. |
+| **Slow Setup** | `benches/slow_setup.rs` | Heavyweight one-time operations: safe-prime group parameter generation, full normal key generation (`Gen`), and full anamorphic key generation (`aGen`). Excluded from routine runs due to dominant runtime. |
+| **Slow Stream** | `benches/slow_stream.rs` | Stream-mode anamorphic encryption/decryption using rejection sampling. Benchmarks larger covert payloads (1–256 bytes) that are orders of magnitude slower than single-ciphertext modes. Optional extended analysis. |
+
 ```bash
-# Run benchmarks (release mode, required)
+# Run all benchmark suites (release mode, required)
 cargo bench
+
+# Run a specific suite only
+cargo bench --bench core
+cargo bench --bench slow_setup
+cargo bench --bench slow_stream
 
 # Open HTML report
 open target/criterion/report/index.html
@@ -321,7 +334,7 @@ open target/criterion/report/index.html
 Benchmarks measure **covert payload size (bytes) vs. anamorphic overhead (µs)**, verifying that overhead scales linearly and quantifying the cost over normal-mode encryption.
 
 ```bash
-# Generate benchmark plots (optional)
+# Generate benchmark plots
 python scripts/plot_benchmarks.py target/criterion/
 ```
 
