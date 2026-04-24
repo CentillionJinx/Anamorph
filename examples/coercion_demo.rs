@@ -66,7 +66,14 @@ fn main() {
     // Adversary's view
     let adversary_plaintext = decrypt(&sk, &packet, TEST_MAC_KEY);
     println!("  [ADVERSARY] Attempted normal decrypt with extracted sk:");
-    println!("    -> Rejected by domain separation: {}", adversary_plaintext.is_err());
+    println!(
+        "    -> Visible plaintext: \"{}\"",
+        String::from_utf8_lossy(
+            adversary_plaintext
+                .as_ref()
+                .expect("normal decrypt should recover only the overt message")
+        )
+    );
 
     // Can the adversary detect the covert channel? NO.
     println!("  [ADVERSARY] Can detect covert channel? NO ✗");
@@ -100,7 +107,14 @@ fn main() {
 
     let adversary_xor = decrypt(&sk, &packet_xor, TEST_MAC_KEY);
     println!("  [ADVERSARY] Attempted normal decrypt with extracted sk:");
-    println!("    -> Rejected by domain separation: {}", adversary_xor.is_err());
+    println!(
+        "    -> Visible plaintext: \"{}\"",
+        String::from_utf8_lossy(
+            adversary_xor
+                .as_ref()
+                .expect("normal decrypt should recover only the overt message")
+        )
+    );
     println!("  [ADVERSARY] Packet is authenticated; covert metadata is integrity-protected.");
 
     let receiver_xor = adecrypt_xor(&sk, &dk, &packet_xor, TEST_MAC_KEY)
@@ -131,7 +145,14 @@ fn main() {
 
     let adversary_type2 = decrypt(&sk, &packet_type2, TEST_MAC_KEY);
     println!("  [ADVERSARY] Normal decrypt attempt on anamorphic packet:");
-    println!("    -> Rejected by domain separation: {}", adversary_type2.is_err());
+    println!(
+        "    -> Visible plaintext: \"{}\"",
+        String::from_utf8_lossy(
+            adversary_type2
+                .as_ref()
+                .expect("normal decrypt should recover the dictated message")
+        )
+    );
 
     let receiver_type2 = adecrypt(&sk, &dk, &packet_type2, TEST_MAC_KEY, covert_type2)
         .expect("receiver type-2 decrypt");
@@ -160,7 +181,14 @@ fn main() {
 
     let adversary_t2x = decrypt(&sk, &packet_t2x, TEST_MAC_KEY);
     println!("  [ADVERSARY] Normal decrypt attempt on anamorphic XOR packet:");
-    println!("    -> Rejected by domain separation: {}", adversary_t2x.is_err());
+    println!(
+        "    -> Visible plaintext: \"{}\"",
+        String::from_utf8_lossy(
+            adversary_t2x
+                .as_ref()
+                .expect("normal decrypt should recover the dictated message")
+        )
+    );
 
     let receiver_t2x = adecrypt_xor(&sk, &dk, &packet_t2x, TEST_MAC_KEY)
         .expect("receiver type-2 XOR decrypt");
@@ -190,9 +218,15 @@ fn main() {
     let a_dec = decrypt(&sk, &anamorphic_packet, TEST_MAC_KEY);
 
     println!("  Normal     ct -> \"{}\"", String::from_utf8_lossy(&n_dec));
-    println!("  Anamorphic packet via normal decrypt -> rejected: {}", a_dec.is_err());
-    println!("  Normal packet decrypts as expected.");
-    println!("  ✓ Domain separation prevents cross-protocol packet confusion.");
+    println!(
+        "  Anamorphic ct via normal decrypt -> \"{}\"",
+        String::from_utf8_lossy(
+            a_dec.as_ref()
+                .expect("normal decrypt should expose only the overt message")
+        )
+    );
+    println!("  Both packets decrypt to the same overt plaintext under normal decryption.");
+    println!("  ✓ Hidden payload remains invisible without the double key.");
     println!();
 
     // =====================================================================
@@ -271,9 +305,16 @@ fn main() {
     );
 
     println!("  Anamorphic ct carries covert \"sec\"? -> {}", if has_covert { "YES ✓" } else { "NO ✗" });
-    println!("  Normal ct carries covert \"sec\"?     -> {}", if no_covert.is_ok() { "YES ✗ (unexpected)!" } else { "NO ✓" });
+    println!(
+        "  Normal ct carries covert \"sec\"?     -> {}",
+        match no_covert {
+            Ok(true) => "YES ✗ (unexpected)!",
+            Ok(false) => "NO ✓",
+            Err(_) => "NO ✓ (rejected as malformed)",
+        }
+    );
     assert!(has_covert);
-    assert!(no_covert.is_err());
+    assert_eq!(no_covert, Ok(false));
     println!("  ✓ Presence indicator correctly differentiates!");
     println!();
 
@@ -284,11 +325,11 @@ fn main() {
     println!("║                   SIMULATION COMPLETE                        ║");
     println!("╠══════════════════════════════════════════════════════════════╣");
     println!("║  ✓ Type-1 Coercion (PRF + XOR): Covert survives key          ║");
-    println!("║    extraction. Adversary sees only normal plaintext.         ║");
+    println!("║    extraction. Adversary sees only the overt plaintext.      ║");
     println!("║  ✓ Type-2 Coercion (PRF + XOR): Covert survives dictated     ║");
     println!("║    plaintext. Adversary's compliance check passes.           ║");
-    println!("║  ✓ Domain separation: normal decrypt rejects anamorphic      ║");
-    println!("║    packets while authenticated decrypt paths succeed.        ║");
+    println!("║  ✓ Overt view separation: normal decrypt exposes only the    ║");
+    println!("║    overt plaintext while authenticated covert paths succeed. ║");
     println!("║  ✓ EC24 Multi-Use: Ratcheted double keys provide fresh       ║");
     println!("║    randomness across multiple transmissions.                 ║");
     println!("║  ✓ EC24 Presence: Receiver can detect covert payload         ║");
